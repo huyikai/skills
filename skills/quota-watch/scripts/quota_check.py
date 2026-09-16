@@ -355,7 +355,7 @@ def main():
         except Exception as e:
             results.append(make_error(p.get("name", p["type"]), str(e)[:150]))
 
-    # 历史记录（小时增量）
+    # 历史记录（小时增量）；读写失败只降级为提示，不阻断报告与推送
     history_path = os.path.expanduser(cfg.get("history_path", "~/.quota-watch/history.jsonl"))
     prev = None
     try:
@@ -363,8 +363,9 @@ def main():
             lines = f.read().strip().splitlines()
             if lines:
                 prev = json.loads(lines[-1])
-    except (FileNotFoundError, ValueError):
-        pass
+    except Exception:
+        prev = None
+    hist_err = None
     rec = {"ts": now}
     for r in results:
         if r.get("ok") and r.get("used_pct") is not None:
@@ -372,9 +373,13 @@ def main():
             if prev and r["title"] in prev:
                 h = (now - prev["ts"]) / 3600
                 r["rows"].append(("小时增量", f"{r['used_pct'] - prev[r['title']]:+.1f}pp（{h:.1f}h 前）"))
-    os.makedirs(os.path.dirname(history_path), exist_ok=True)
-    with open(history_path, "a") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    try:
+        if os.path.dirname(history_path):
+            os.makedirs(os.path.dirname(history_path), exist_ok=True)
+        with open(history_path, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        hist_err = f"⚠ 历史记录写入失败（不影响本次报告与推送）: {e}"
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
@@ -382,6 +387,8 @@ def main():
 
     # 纯文本输出
     out = [f"额度巡检 @ {now_dt}（配置: {cfg_path}）", ""]
+    if hist_err:
+        out += [hist_err, ""]
     for r in results:
         if not r.get("ok"):
             out.append(f"❌ {r['title']}: {r.get('error')}")
