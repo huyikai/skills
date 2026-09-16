@@ -1,0 +1,35 @@
+{
+  "providers": [
+    {
+      "type": "zhipu",
+      "name": "智谱GLM",
+      "api_key": "env:ZHIPU_API_KEY"
+    },
+    {
+      "type": "minimax",
+      "name": "MiniMax",
+      "api_key": "env:MINIMAX_API_KEY"
+    },
+    {
+      "type": "deepseek",
+      "name": "DeepSeek",
+      "api_key": "env:DEEPSEEK_API_KEY"
+    },
+    {
+      "type": "relay_quota",
+      "name": "MyRelay",
+      "base_url": "https://your-relay.example.com",
+      "api_key": "env:RELAY_API_KEY"
+    }
+  ],
+  "email": {
+    "enabled": false,
+    "host": "smtp.qq.com",
+    "port": 465,
+    "user": "you@qq.com",
+    "password": "SMTP授权码（非登录密码）",
+    "to": ["you@qq.com"]
+  },
+  "mac_notify": true,
+  "history_path": "~/.quota-watch/history.jsonl"
+}
