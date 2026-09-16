@@ -1,6 +1,6 @@
 ---
 name: quota-watch
-description: 查询并巡检 AI API 订阅额度与余额（智谱GLM Coding Plan / MiniMax Token Plan / DeepSeek 余额 / 兼容 /v1/usage 配额窗口的中转站），按周窗口理想消耗曲线判定用量偏快还是偏慢，支持 HTML 邮件与 macOS 本地通知推送。当用户想查 API 余额、剩余额度、套餐用量，或要做定时额度巡检时使用。
+description: 查询并巡检 AI API 订阅额度与余额（任何提供额度/余额查询接口的平台均可接入，通用中转站方式优先，另有常用平台内置适配），按周窗口理想消耗曲线判定用量偏快还是偏慢，支持 HTML 邮件与 macOS 本地通知推送。当用户想查 API 余额、剩余额度、套餐用量，或要做定时额度巡检时使用。
 ---
 
 # quota-watch — AI API 额度巡检
@@ -15,14 +15,12 @@ description: 查询并巡检 AI API 订阅额度与余额（智谱GLM Coding Pla
 复制 `config.example.json` 为 `./quota-watch.json` 或 `~/.config/quota-watch/config.json`，
 填入各平台的 API Key。密钥支持 `"env:VARNAME"` 形式引用环境变量，避免明文落盘。
 
-各平台密钥获取位置：
+每个 provider 是一个条目，`type` 指定接入方式：
 
-| type | 平台 | 密钥来源 |
+| 接入方式 | type | 说明 |
 |---|---|---|
-| `zhipu` | 智谱 GLM Coding Plan | bigmodel.cn 控制台 API Keys |
-| `minimax` | MiniMax Token Plan | platform.minimaxi.com（sk-cp- 开头的套餐专用 Key） |
-| `deepseek` | DeepSeek 按量余额 | platform.deepseek.com API Keys |
-| `relay_quota` | 兼容中转站 | 站点控制台，`base_url` 填 API 根地址 |
+| 通用中转站（推荐） | `relay_quota` | 任何兼容 `/v1/usage` 配额窗口的平台/中转站，填 `base_url` 即可接入，密钥在站点控制台获取 |
+| 内置适配 | `zhipu` / `minimax` / `deepseek` | 常见订阅/按量平台的内置适配，密钥在各平台开放平台控制台获取 |
 
 ### 2. 运行
 
@@ -60,8 +58,8 @@ crontab 方式（每小时）：
 ## 输出说明
 
 - **终端**：纯文本摘要
-- **邮件**（`email.enabled: true`）：HTML 卡片周报，主题即状态，
-  如 `[quota-watch] GLM 7%【🌱偏慢7%】 MiniMax 32%【✅正常】 14:00`
+- **邮件**（`email.enabled: true`）：HTML 卡片周报，主题即状态（名称即配置里的 provider `name`），
+  如 `[quota-watch] 主力套餐 7%【🌱偏慢7%】 备用中转 32%【✅正常】 14:00`
 - **macOS 通知**（`mac_notify: true`）：通知中心弹窗，存在偏快/耗尽预警时带提示音
 - **历史**：每次运行追加到 `history_path`（JSONL），报告自动带「小时增量」
 

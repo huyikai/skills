@@ -33,7 +33,7 @@ git clone https://github.com/huyikai/skills && cd skills
 
 | Skill | 分类 | 说明 |
 |-------|------|------|
-| quota-watch | workflow | 巡检智谱 GLM / MiniMax / DeepSeek 等 AI API 套餐额度与余额，按周理想消耗曲线判定用量偏快偏慢，支持邮件与 macOS 通知 |
+| quota-watch | workflow | 巡检 AI API 订阅额度与余额，按周理想消耗曲线判定用量偏快偏慢，支持邮件与 macOS 通知 |
 <!-- 新增 skill 后在此添加一行，例如：
 | my-skill | writing | 一句话说明用途和触发场景 |
 -->
