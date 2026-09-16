@@ -329,8 +329,8 @@ def load_config(path=None):
         if c and os.path.isfile(os.path.expanduser(c)):
             with open(os.path.expanduser(c)) as f:
                 return json.load(f), os.path.expanduser(c)
-    raise SystemExit("未找到配置文件。请参考 config.example.json 创建 ./quota-watch.json "
-                     "或 ~/.config/quota-watch/config.json")
+    raise SystemExit("未找到配置文件。请参考 config.example.json 创建 ./quota-watch.json、"
+                     "技能目录下的 config.json 或 ~/.config/quota-watch/config.json")
 
 
 def main():
@@ -367,6 +367,7 @@ def main():
         prev = None
     hist_err = None
     rec = {"ts": now}
+    hist_dir = os.path.dirname(history_path)
     for r in results:
         if r.get("ok") and r.get("used_pct") is not None:
             rec[r["title"]] = r["used_pct"]
@@ -374,14 +375,16 @@ def main():
                 h = (now - prev["ts"]) / 3600
                 r["rows"].append(("小时增量", f"{r['used_pct'] - prev[r['title']]:+.1f}pp（{h:.1f}h 前）"))
     try:
-        if os.path.dirname(history_path):
-            os.makedirs(os.path.dirname(history_path), exist_ok=True)
+        if hist_dir:
+            os.makedirs(hist_dir, exist_ok=True)
         with open(history_path, "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
         hist_err = f"⚠ 历史记录写入失败（不影响本次报告与推送）: {e}"
 
     if args.json:
+        if hist_err:
+            print(hist_err, file=sys.stderr)
         print(json.dumps(results, ensure_ascii=False, indent=2))
         return
 
