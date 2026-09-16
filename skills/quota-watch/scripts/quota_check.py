@@ -65,9 +65,9 @@ def verdict_cn(diff):
     if diff > 5:
         return "偏快", "⚡", "#ea580c"
     if diff < -15:
-        return "明显偏慢", "🐢", "#64748b"
+        return "明显偏慢", "🐌", "#64748b"
     if diff < -5:
-        return "偏慢", "🌱", "#2563eb"
+        return "偏慢", "🐢", "#2563eb"
     return "正常", "✅", "#16a34a"
 
 
