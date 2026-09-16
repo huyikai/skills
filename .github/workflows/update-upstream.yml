@@ -1,0 +1,39 @@
+# 每周自动刷新第三方开源 skill：跑 add-upstream.sh update，
+# 有变化则以 github-actions[bot] 身份提交并推送，各设备 ./scripts/install.sh update 同步。
+# 注意：GitHub 定时任务按 UTC 解释且可能延迟数分钟；仓库连续 60 天无活动会被自动停用 schedule。
+name: update-upstream
+
+on:
+  schedule:
+    # 每周一 06:00 北京时间（UTC 周日 22:00）
+    - cron: "0 22 * * 0"
+  workflow_dispatch
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-upstream
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 刷新第三方 skill
+        run: ./scripts/add-upstream.sh update
+
+      - name: 有变化则提交并推送
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "==> 上游无变化，跳过提交"
+            exit 0
+          fi
+          names="$(git diff --cached --name-only | cut -d/ -f2 | sort -u | grep -v '^upstream.tsv$' | tr '\n' ' ')"
+          git commit -m "chore(upstream): refresh third-party skills: $names"
+          git push
