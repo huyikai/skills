@@ -7,7 +7,7 @@
 用法:
     python3 quota_check.py [--config PATH] [--dry-run] [--json]
 
-配置查找顺序: --config 指定路径 > ./quota-watch.json > ~/.config/quota-watch/config.json
+配置查找顺序: --config 指定路径 > ./quota-watch.json > <技能目录>/config.json > ~/.config/quota-watch/config.json
 支持平台: zhipu(智谱GLM Coding Plan) / minimax(Token Plan) / deepseek(按量余额)
           / relay_quota(兼容 /v1/usage 配额窗口的中转站)
 """
@@ -25,7 +25,9 @@ from email.mime.text import MIMEText
 
 CST = timedelta(hours=8)
 WEEK_MS = 7 * 86400 * 1000
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATHS = ["./quota-watch.json",
+                        os.path.join(os.path.dirname(SCRIPT_DIR), "config.json"),
                         os.path.expanduser("~/.config/quota-watch/config.json")]
 
 
