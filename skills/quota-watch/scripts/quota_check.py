@@ -317,23 +317,27 @@ def send_email(cfg, subject, html):
 NOTIFY_APP = os.path.expanduser("~/.quota-watch/QuotaNotifier.app")
 NOTIFY_BIN = NOTIFY_APP + "/Contents/MacOS/QuotaNotifier"
 NOTIFY_SRC = '''import Foundation
-import AppKit
+import UserNotifications
 
 let args = CommandLine.arguments
 guard args.count >= 3 else { exit(0) }  // 点击通知唤起时无参数，静默退出
-let note = NSUserNotification()
-note.title = args[1]
-note.informativeText = args[2]
-if args.count >= 4 { note.subtitle = args[3] }
-if args.count >= 5 && args[4] == "1" { note.soundName = NSUserNotificationDefaultSoundName }
-final class Del: NSObject, NSUserNotificationCenterDelegate {
-    func userNotificationCenter(_ c: NSUserNotificationCenter,
-                                shouldPresent n: NSUserNotification) -> Bool { true }
+let sem = DispatchSemaphore(value: 0)
+let center = UNUserNotificationCenter.current()
+center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+    if granted {
+        let content = UNMutableNotificationContent()
+        content.title = args[1]
+        content.body = args[2]
+        if args.count >= 4 { content.subtitle = args[3] }
+        if args.count >= 5 && args[4] == "1" { content.sound = .default }
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        center.add(req) { _ in sem.signal() }
+    } else {
+        sem.signal()
+    }
 }
-let center = NSUserNotificationCenter.default
-center.delegate = Del()
-center.scheduleNotification(note)
-RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+_ = sem.wait(timeout: .now() + 8)
+exit(0)
 '''
 NOTIFY_PLIST = '''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -354,8 +358,12 @@ NOTIFY_PLIST = '''<?xml version="1.0" encoding="UTF-8"?>
 
 
 def _ensure_notify_bin():
-    """确保通知助手 .app 存在；用系统 swiftc 现场编译一次，失败返回 False。"""
-    if os.path.isfile(NOTIFY_BIN) and os.access(NOTIFY_BIN, os.X_OK):
+    """确保通知助手 .app 存在且与当前源码一致；用系统 swiftc 现场编译，失败返回 False。"""
+    import hashlib
+    src_hash = hashlib.sha256(NOTIFY_SRC.encode()).hexdigest()[:16]
+    hash_file = NOTIFY_APP + "/Contents/.src-hash"
+    if (os.path.isfile(NOTIFY_BIN) and os.access(NOTIFY_BIN, os.X_OK)
+            and os.path.isfile(hash_file) and open(hash_file).read().strip() == src_hash):
         return True
     try:
         if subprocess.run(["swiftc", "--version"], capture_output=True).returncode != 0:
@@ -372,6 +380,8 @@ def _ensure_notify_bin():
             return False
         with open(os.path.join(macos_dir, "..", "Info.plist"), "w") as f:
             f.write(NOTIFY_PLIST)
+        with open(hash_file, "w") as f:
+            f.write(src_hash)
         return True
     except Exception:
         return False
