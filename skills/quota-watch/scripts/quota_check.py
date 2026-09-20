@@ -377,12 +377,25 @@ def _ensure_notify_bin():
         return False
 
 
+def _register_notify_app():
+    """在 LaunchServices 注册通知助手（仅一次）。未注册时点击通知无法唤起该 app。"""
+    flag = NOTIFY_APP + "/Contents/.ls-registered"
+    if os.path.exists(flag):
+        return
+    try:
+        subprocess.run(["open", "-g", NOTIFY_APP], capture_output=True, timeout=15)
+        open(flag, "w").close()
+    except Exception:
+        pass
+
+
 def notify_macos(title, text, urgent, subtitle=""):
-    """macOS 通知。优先走独立助手（title/副标题/多行正文），失败回退 osascript。"""
+    """macOS 通知。优先走独立助手（点击不会打开脚本编辑器），失败回退 osascript。"""
     title = title.replace('"', "'")
     text = text.replace('"', "'")
     subtitle = subtitle.replace('"', "'")
     if _ensure_notify_bin():
+        _register_notify_app()
         cmd = [NOTIFY_BIN, title, text] + ([subtitle] if subtitle else []) + (["1"] if urgent else [])
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
@@ -494,19 +507,11 @@ def main():
             except Exception as e:
                 status_msgs.append(f"📧 邮件推送失败: {e}")
         if cfg.get("mac_notify"):
-            ok_r = [r for r in results if r.get("ok")]
+            body = "\n".join(r["subject_seg"] for r in results if r.get("ok"))
             bad_r = [r for r in results if not r.get("ok")]
-            warn_r = [r for r in ok_r if r.get("warn") or (r.get("diff", 0) or 0) > 5]
-            parts = []
-            if warn_r:
-                parts.append(f"⚠ {len(warn_r)} 项偏快")
-            if bad_r:
-                parts.append(f"❌ {len(bad_r)} 项失败")
-            summary = " · ".join(parts) if parts else "✅ 全部正常"
-            body = "\n".join(r["subject_seg"] for r in ok_r)
             if bad_r:
                 body += ("\n" if body else "") + "❌ " + "、".join(r["title"] for r in bad_r)
-            status_msgs.append(notify_macos(f"额度巡检 {now_dt.split(' ')[1]}", body, urgent, subtitle=summary))
+            status_msgs.append(notify_macos(f"额度巡检 {now_dt.split(' ')[1]}", body, urgent))
     out += status_msgs
     print("\n".join(out))
 
