@@ -312,9 +312,64 @@ def send_email(cfg, subject, html):
     return f"📧 已推送邮件至 {msg['To']}"
 
 
-def notify_macos(title, text, urgent):
+# 独立通知助手：让通知归属于自身（点击不会打开脚本编辑器），osascript 派的通知点击会唤起脚本编辑器
+NOTIFY_BIN = os.path.expanduser("~/.quota-watch/qw-notify")
+NOTIFY_SRC = '''import Foundation
+import AppKit
+
+let args = CommandLine.arguments
+guard args.count >= 3 else { exit(0) }  // 点击通知唤起时无参数，静默退出
+let note = NSUserNotification()
+note.title = args[1]
+note.informativeText = args[2]
+if args.count >= 4 { note.subtitle = args[3] }
+if args.count >= 5 && args[4] == "1" { note.soundName = NSUserNotificationDefaultSoundName }
+final class Del: NSObject, NSUserNotificationCenterDelegate {
+    func userNotificationCenter(_ c: NSUserNotificationCenter,
+                                shouldPresent n: NSUserNotification) -> Bool { true }
+}
+let center = NSUserNotificationCenter.default
+center.delegate = Del()
+center.scheduleNotification(note)
+RunLoop.main.run(until: Date().addingTimeInterval(0.8))
+'''
+
+
+def _ensure_notify_bin():
+    """确保通知助手二进制存在；用系统 swiftc 现场编译一次，失败返回 False。"""
+    if os.path.isfile(NOTIFY_BIN) and os.access(NOTIFY_BIN, os.X_OK):
+        return True
+    try:
+        if subprocess.run(["swiftc", "--version"], capture_output=True).returncode != 0:
+            return False
+        os.makedirs(os.path.dirname(NOTIFY_BIN), exist_ok=True)
+        src = NOTIFY_BIN + ".swift"
+        with open(src, "w") as f:
+            f.write(NOTIFY_SRC)
+        r = subprocess.run(["swiftc", "-O", "-o", NOTIFY_BIN, src],
+                           capture_output=True, text=True, timeout=180)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def notify_macos(title, text, urgent, subtitle=""):
+    """macOS 通知。优先走独立助手（title/副标题/多行正文），失败回退 osascript。"""
+    title = title.replace('"', "'")
     text = text.replace('"', "'")
-    script = f'display notification "{text}" with title "{title}"'
+    subtitle = subtitle.replace('"', "'")
+    if _ensure_notify_bin():
+        cmd = [NOTIFY_BIN, title, text] + ([subtitle] if subtitle else []) + (["1"] if urgent else [])
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                return "🔔 已发本地通知"
+        except Exception:
+            pass
+    body = text.replace("\n", '" & linefeed & "')
+    script = f'display notification "{body}" with title "{title}"'
+    if subtitle:
+        script += f' subtitle "{subtitle}"'
     if urgent:
         script += ' sound name "Ping"'
     r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
@@ -415,9 +470,19 @@ def main():
             except Exception as e:
                 status_msgs.append(f"📧 邮件推送失败: {e}")
         if cfg.get("mac_notify"):
-            status_msgs.append(notify_macos(f"额度巡检 {now_dt.split(' ')[1]}",
-                                            " ".join(r["subject_seg"] for r in results if r.get("ok")),
-                                            urgent))
+            ok_r = [r for r in results if r.get("ok")]
+            bad_r = [r for r in results if not r.get("ok")]
+            warn_r = [r for r in ok_r if r.get("warn") or (r.get("diff", 0) or 0) > 5]
+            parts = []
+            if warn_r:
+                parts.append(f"⚠ {len(warn_r)} 项偏快")
+            if bad_r:
+                parts.append(f"❌ {len(bad_r)} 项失败")
+            summary = " · ".join(parts) if parts else "✅ 全部正常"
+            body = "\n".join(r["subject_seg"] for r in ok_r)
+            if bad_r:
+                body += ("\n" if body else "") + "❌ " + "、".join(r["title"] for r in bad_r)
+            status_msgs.append(notify_macos(f"额度巡检 {now_dt.split(' ')[1]}", body, urgent, subtitle=summary))
     out += status_msgs
     print("\n".join(out))
 
