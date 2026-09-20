@@ -218,17 +218,7 @@ def check_relay_quota(p):
     t = data.get("usage", {}).get("total", {})
     if t:
         rows.append(("累计消费", f"${t.get('actual_cost', 0):,.2f}（{t.get('requests', 0):,} 次请求）"))
-    r = make_simple(p.get("name", "Relay"), seg, rows, emoji="🛰")
-    # 有 7d 窗口时补一条理想曲线判定
-    w7 = windows.get("7d")
-    if w7 and w7.get("window_start"):
-        start = datetime.fromisoformat(w7["window_start"]).timestamp() * 1000
-        ideal = (time.time() * 1000 - start) / (7 * 86400000) * 100
-        used_pct = w7["used"] / w7["limit"] * 100 if w7["limit"] else 0
-        v, e, color = verdict_cn(used_pct - ideal)
-        r["rows"].append(("周进度判定", f"{e} {v}（已用 {used_pct:.1f}% vs 理想 {ideal:.1f}%）"))
-        r["color"] = color
-    return r
+    return make_simple(p.get("name", "Relay"), seg, rows, emoji="🛰")
 
 
 CHECKERS = {"zhipu": check_zhipu, "minimax": check_minimax,
@@ -312,32 +302,94 @@ def send_email(cfg, subject, html):
     return f"📧 已推送邮件至 {msg['To']}"
 
 
-# 独立通知助手 .app：让通知归属于自身（点击不会打开脚本编辑器）。
-# 裸二进制发的通知会被新版 macOS 静默丢弃，必须是带 Info.plist 的正规 bundle。
-NOTIFY_APP = os.path.expanduser("~/.quota-watch/QuotaNotifier.app")
+# 独立通知横幅:不走系统通知中心(第三方 app 授权在这台机器上无法完成),
+# 用 AppKit 自绘右上角横幅窗口——无需授权、自动消失、点击关闭、不打开任何程序。
+NOTIFY_APP = os.path.expanduser("~/Library/Application Support/quota-watch/QuotaNotifier.app")
 NOTIFY_BIN = NOTIFY_APP + "/Contents/MacOS/QuotaNotifier"
 NOTIFY_SRC = '''import Foundation
-import UserNotifications
+import AppKit
 
 let args = CommandLine.arguments
-guard args.count >= 3 else { exit(0) }  // 点击通知唤起时无参数，静默退出
-let sem = DispatchSemaphore(value: 0)
-let center = UNUserNotificationCenter.current()
-center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
-    if granted {
-        let content = UNMutableNotificationContent()
-        content.title = args[1]
-        content.body = args[2]
-        if args.count >= 4 { content.subtitle = args[3] }
-        if args.count >= 5 && args[4] == "1" { content.sound = .default }
-        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        center.add(req) { _ in sem.signal() }
-    } else {
-        sem.signal()
-    }
+guard args.count >= 3 else { exit(0) }  // 点击唤起时无参数，静默退出
+let title = args[1]
+let body = args[2]
+let urgent = args.count >= 4 && args[3] == "1"
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+
+class BannerPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
 }
-_ = sem.wait(timeout: .now() + 8)
-exit(0)
+
+let panel = BannerPanel(contentRect: NSRect(x: 0, y: 0, width: 380, height: 100),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+panel.level = .floating
+panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+panel.isOpaque = false
+panel.backgroundColor = .clear
+panel.hasShadow = true
+
+let v = NSView()
+v.wantsLayer = true
+v.layer?.backgroundColor = NSColor(calibratedWhite: 0.10, alpha: 0.94).cgColor
+v.layer?.cornerRadius = 12
+if urgent { v.layer?.borderWidth = 1.5; v.layer?.borderColor = NSColor.systemRed.cgColor }
+
+let titleAttr: [NSAttributedString.Key: Any] = [
+    .font: NSFont.boldSystemFont(ofSize: 14),
+    .foregroundColor: urgent ? NSColor.systemRed : NSColor.white]
+let bodyAttr: [NSAttributedString.Key: Any] = [
+    .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular),
+    .foregroundColor: NSColor(calibratedWhite: 0.88, alpha: 1)]
+let text = NSMutableAttributedString(string: title + "\\n", attributes: titleAttr)
+text.append(NSAttributedString(string: body, attributes: bodyAttr))
+
+let tv = NSTextField(labelWithAttributedString: text)
+tv.lineBreakMode = .byClipping
+tv.maximumNumberOfLines = 10
+tv.translatesAutoresizingMaskIntoConstraints = false
+v.addSubview(tv)
+v.translatesAutoresizingMaskIntoConstraints = false
+panel.contentView = v
+panel.contentView?.wantsLayer = true
+
+let width: CGFloat = 380
+let pad: CGFloat = 16
+let textSize = text.boundingRect(with: NSSize(width: width - pad * 2, height: 800),
+                                 options: [.usesLineFragmentOrigin, .usesFontLeading], context: nil)
+let height = textSize.height + pad * 2
+NSLayoutConstraint.activate([
+    tv.topAnchor.constraint(equalTo: v.topAnchor, constant: pad),
+    tv.bottomAnchor.constraint(equalTo: v.bottomAnchor, constant: -pad),
+    tv.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: pad),
+    tv.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -pad),
+])
+
+if let screen = NSScreen.main {
+    let vf = screen.visibleFrame
+    panel.setFrame(NSRect(x: vf.maxX - width - 12, y: vf.maxY - height - 10,
+                          width: width, height: height), display: true)
+}
+
+let close = {
+    panel.orderOut(nil)
+    exit(0)
+}
+final class Closer: NSObject {
+    let f: () -> Void
+    init(_ f: @escaping () -> Void) { self.f = f }
+    @objc func go() { f() }
+}
+let closer = Closer(close)
+panel.contentView?.addGestureRecognizer(NSClickGestureRecognizer(target: closer, action: #selector(Closer.go)))
+
+panel.orderFrontRegardless()
+if urgent { NSSound(named: "Funk")?.play() }
+
+DispatchQueue.main.asyncAfter(deadline: .now() + (urgent ? 12 : 8)) { close() }
+app.run()
 '''
 NOTIFY_PLIST = '''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -368,6 +420,8 @@ def _ensure_notify_bin():
     try:
         if subprocess.run(["swiftc", "--version"], capture_output=True).returncode != 0:
             return False
+        import shutil
+        shutil.rmtree(NOTIFY_APP, ignore_errors=True)  # 全新构建，避免旧签名密封导致 codesign 失败
         macos_dir = os.path.dirname(NOTIFY_BIN)
         os.makedirs(macos_dir, exist_ok=True)
         src = NOTIFY_BIN + ".swift"
@@ -382,41 +436,29 @@ def _ensure_notify_bin():
             f.write(NOTIFY_PLIST)
         with open(hash_file, "w") as f:
             f.write(src_hash)
-        return True
+        # ad-hoc 签名必须放最后：签名后再往 bundle 写任何文件都会使签名失效，
+        # 而无有效签名的 bundle 会被通知系统拒绝授权(UNErrorDomain 1)
+        r2 = subprocess.run(["codesign", "--force", "--sign", "-", NOTIFY_APP],
+                            capture_output=True, text=True, timeout=60)
+        return r2.returncode == 0
     except Exception:
         return False
 
 
-def _register_notify_app():
-    """在 LaunchServices 注册通知助手（仅一次）。未注册时点击通知无法唤起该 app。"""
-    flag = NOTIFY_APP + "/Contents/.ls-registered"
-    if os.path.exists(flag):
-        return
-    try:
-        subprocess.run(["open", "-g", NOTIFY_APP], capture_output=True, timeout=15)
-        open(flag, "w").close()
-    except Exception:
-        pass
-
-
-def notify_macos(title, text, urgent, subtitle=""):
-    """macOS 通知。优先走独立助手（点击不会打开脚本编辑器），失败回退 osascript。"""
+def notify_macos(title, text, urgent):
+    """macOS 桌面横幅(自绘,无需系统通知授权)。失败回退 osascript。"""
     title = title.replace('"', "'")
     text = text.replace('"', "'")
-    subtitle = subtitle.replace('"', "'")
     if _ensure_notify_bin():
-        _register_notify_app()
-        cmd = [NOTIFY_BIN, title, text] + ([subtitle] if subtitle else []) + (["1"] if urgent else [])
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            r = subprocess.run([NOTIFY_BIN, title, text] + (["1"] if urgent else []),
+                               capture_output=True, text=True, timeout=20)
             if r.returncode == 0:
-                return "🔔 已发本地通知"
+                return "🔔 已发桌面横幅"
         except Exception:
             pass
     body = text.replace("\n", '" & linefeed & "')
     script = f'display notification "{body}" with title "{title}"'
-    if subtitle:
-        script += f' subtitle "{subtitle}"'
     if urgent:
         script += ' sound name "Ping"'
     r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
