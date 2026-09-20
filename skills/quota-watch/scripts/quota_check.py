@@ -169,7 +169,7 @@ def check_minimax(p):
         rows = [("本周已用", f"{used_pct:.1f}%　剩余 {wk_rem}%"),
                 ("理想应达", f"{ideal:.1f}%"),
                 ("周窗口", f"{fmt_ms(w_start)} → {fmt_ms(w_end)}")]
-        result = make_result(f"{p.get('name', 'MiniMax')} {name}", "Token Plan",
+        result = make_result(p.get('name', 'MiniMax'), "Token Plan",
                              used_pct, ideal, w_start, w_end, rows)
         result["rows"].append(("动态", f"5小时窗口剩余 {m.get('current_interval_remaining_percent')}%"))
     if extras and result:
@@ -188,7 +188,7 @@ def check_deepseek(p):
     b = data["balance_infos"][0]
     status = "✅ 可用" if data.get("is_available") else "⛔ 不可用"
     return make_simple(p.get("name", "DeepSeek"),
-                       f"{p.get('name', 'DeepSeek')} {b['currency']} {b['total_balance']}",
+                       f"{p.get('name', 'DeepSeek')} {b['total_balance']}",
                        [("余额", f"{b['currency']} {b['total_balance']}"),
                         ("状态", status),
                         ("赠送金", b.get("granted_balance", "?"))],
@@ -312,8 +312,10 @@ def send_email(cfg, subject, html):
     return f"📧 已推送邮件至 {msg['To']}"
 
 
-# 独立通知助手：让通知归属于自身（点击不会打开脚本编辑器），osascript 派的通知点击会唤起脚本编辑器
-NOTIFY_BIN = os.path.expanduser("~/.quota-watch/qw-notify")
+# 独立通知助手 .app：让通知归属于自身（点击不会打开脚本编辑器）。
+# 裸二进制发的通知会被新版 macOS 静默丢弃，必须是带 Info.plist 的正规 bundle。
+NOTIFY_APP = os.path.expanduser("~/.quota-watch/QuotaNotifier.app")
+NOTIFY_BIN = NOTIFY_APP + "/Contents/MacOS/QuotaNotifier"
 NOTIFY_SRC = '''import Foundation
 import AppKit
 
@@ -333,22 +335,44 @@ center.delegate = Del()
 center.scheduleNotification(note)
 RunLoop.main.run(until: Date().addingTimeInterval(0.8))
 '''
+NOTIFY_PLIST = '''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleName</key><string>QuotaNotifier</string>
+    <key>CFBundleDisplayName</key><string>quota-watch 通知</string>
+    <key>CFBundleIdentifier</key><string>local.skills.quota-watch.notifier</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>1.0</string>
+    <key>CFBundleExecutable</key><string>QuotaNotifier</string>
+    <key>LSUIElement</key><true/>
+    <key>NSUserNotificationAlertStyle</key><string>banner</string>
+</dict>
+</plist>
+'''
 
 
 def _ensure_notify_bin():
-    """确保通知助手二进制存在；用系统 swiftc 现场编译一次，失败返回 False。"""
+    """确保通知助手 .app 存在；用系统 swiftc 现场编译一次，失败返回 False。"""
     if os.path.isfile(NOTIFY_BIN) and os.access(NOTIFY_BIN, os.X_OK):
         return True
     try:
         if subprocess.run(["swiftc", "--version"], capture_output=True).returncode != 0:
             return False
-        os.makedirs(os.path.dirname(NOTIFY_BIN), exist_ok=True)
+        macos_dir = os.path.dirname(NOTIFY_BIN)
+        os.makedirs(macos_dir, exist_ok=True)
         src = NOTIFY_BIN + ".swift"
         with open(src, "w") as f:
             f.write(NOTIFY_SRC)
         r = subprocess.run(["swiftc", "-O", "-o", NOTIFY_BIN, src],
                            capture_output=True, text=True, timeout=180)
-        return r.returncode == 0
+        os.remove(src)
+        if r.returncode != 0:
+            return False
+        with open(os.path.join(macos_dir, "..", "Info.plist"), "w") as f:
+            f.write(NOTIFY_PLIST)
+        return True
     except Exception:
         return False
 
@@ -461,7 +485,7 @@ def main():
 
     status_msgs = []
     urgent = any(r.get("warn") or (r.get("diff", 0) or 0) > 5 or not r.get("ok") for r in results)
-    subject = "[quota-watch] " + " ".join(r["subject_seg"] for r in results if r.get("ok")) + f" {now_dt.split(' ')[1]}"
+    subject = "[额度用量] " + " ".join(r["subject_seg"] for r in results if r.get("ok")) + f" {now_dt.split(' ')[1]}"
     if not args.dry_run:
         email_cfg = cfg.get("email", {})
         if email_cfg.get("enabled"):
