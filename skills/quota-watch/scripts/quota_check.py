@@ -123,19 +123,27 @@ def check_zhipu(p):
     result, extra = None, ""
     for lim in data["data"].get("limits", []):
         total, used = lim.get("usage") or 0, lim.get("currentValue") or 0
+        nrt = lim.get("nextResetTime")  # 智谱在部分窗口状态下不返回该字段，禁止硬取
         if lim.get("unit") == 6:  # 周窗口
-            end, start = lim["nextResetTime"], lim["nextResetTime"] - WEEK_MS
-            ideal = (time.time() * 1000 - start) / WEEK_MS * 100
-            rows = [("本周已用", f"{used / total * 100:.1f}%　用量 {used:,} / {total:,}"),
-                    ("理想应达", f"{ideal:.1f}%"),
-                    ("周窗口", "滚动 7 天")]
-            result = make_result(p.get("name", "智谱 GLM"),
-                                 f"{data['data'].get('level', '?')} 套餐",
-                                 used / total * 100 if total else 0.0, ideal,
-                                 start, end, rows)
+            pct = used / total * 100 if total else 0.0
+            if nrt:
+                end, start = nrt, nrt - WEEK_MS
+                ideal = (time.time() * 1000 - start) / WEEK_MS * 100
+                rows = [("本周已用", f"{pct:.1f}%　用量 {used:,} / {total:,}"),
+                        ("理想应达", f"{ideal:.1f}%"),
+                        ("周窗口", "滚动 7 天")]
+                result = make_result(p.get("name", "智谱 GLM"),
+                                     f"{data['data'].get('level', '?')} 套餐",
+                                     pct, ideal, start, end, rows)
+            else:  # 缺重置时间：只报用量，跳过理想曲线
+                rows = [("本周已用", f"{pct:.1f}%　用量 {used:,} / {total:,}"),
+                        ("周窗口", "滚动 7 天（重置时间未知）")]
+                result = make_simple(p.get("name", "智谱 GLM"),
+                                     f"{p.get('name', '智谱 GLM')} {pct:.0f}%", rows)
         elif lim.get("unit") == 3:
+            reset = f"{fmt_ms(nrt)} 重置" if nrt else "重置时间未知"
             extra = (f"5小时窗口已用 {used / total * 100 if total else 0:.1f}%"
-                     f"（{used:,}/{total:,}），{fmt_ms(lim['nextResetTime'])} 重置")
+                     f"（{used:,}/{total:,}），{reset}")
     if result is None:
         return make_error(p.get("name", "智谱 GLM"), "响应中无周额度数据")
     if extra:
