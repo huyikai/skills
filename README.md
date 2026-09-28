@@ -41,6 +41,7 @@ git clone https://github.com/huyikai/skills && cd skills
 | grilling | productivity | [mattpocock/skills](https://github.com/mattpocock/skills) | 同 grill-me，模型可主动调用 |
 | handoff | productivity | [mattpocock/skills](https://github.com/mattpocock/skills) | 把当前对话压缩成交接文档，便于另一个 agent 接手 |
 | wait-what | productivity | [mattpocock/skills](https://github.com/mattpocock/skills) | 没听懂某条消息时，用你缺失的上下文重新解释 |
+| zentao17 | workflow | 自研 | 自部署禅道 17.8 CLI（v1 API）：查/解决/关闭/激活 Bug；服务器地址/账号/课题映射存目录内 `LOCAL.md`（不入库，模板见 `LOCAL.example.md`）；不适用禅道 22+ |
 <!-- 新增 skill 后在此添加一行，例如：
 | my-skill | writing | 自研 | 一句话说明用途和触发场景 |
 -->
