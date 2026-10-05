@@ -2,7 +2,7 @@
 
 - 来源: https://github.com/mattpocock/skills
 - 上游路径: skills/productivity/grill-me
-- 版本: main @ c55ee46073ed
+- 版本: main @ 24fe0ef7737e
 - 许可证: MIT（见本目录 LICENSE）
-- 更新日期: 2026-09-28
+- 更新日期: 2026-10-05
 - 本地改动: 无
