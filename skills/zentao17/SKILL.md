@@ -38,6 +38,8 @@ zentao17 --help
 | 解决(其他方案) | `zentao17 resolve <id> -r duplicate --duplicate-bug <id>`（可选: fixed/notrepro/bydesign/duplicate/external/postponed/willnotfix/tostory） |
 | 关闭 Bug | `zentao17 close <id> -c "备注"` |
 | 激活 Bug | `zentao17 activate <id> [-c "备注"]` |
+| 转派 Bug | `zentao17 assign <id> --to <账号> [-c "备注"]`（网页会话通道） |
+| 添加备注 | `zentao17 comment <id> -c "备注"`（网页会话通道，不改状态） |
 
 ## 意图识别与解析规则（重要）
 
@@ -54,13 +56,24 @@ zentao17 --help
 
 常用选项：`--limit 50 --page 1` 分页；`--order id_desc` 排序；`--json` 输出 JSON 供程序处理；`--insecure` 忽略自签名证书（全局参数，放在子命令前）。
 
+## 网页会话通道（assign / comment）
+
+v1 API 在禅道 17.8 上不开放独立备注与转派（`PUT /bugs/{id}` 忽略 assignedTo/comment、activate 路由 404），这两个命令走网页路由：`bug-assignTo-{id}.html` 与 `action-comment-bug-{id}.html`，用 `login` 已存凭证自动换 zentaosid 会话（缓存于 `~/.config/zentao17/web-session.json`，权限 600，失效自动重登）。实测要点（写死在脚本里）：登录 POST 必须带 `X-Requested-With: XMLHttpRequest` 才返回 success JSON；登录后的页面请求必须带 `Referer`，否则被渲染成访客首页（假登录）。两命令均用 v1 API 回读自验证（指派未变/actions 无新评论即报错）。
+
 ## 使用策略
 
 1. **不知道产品 ID 时**先执行 `zentao17 products`。
-2. **写操作前确认**：resolve/close/activate 属于写操作，执行前向用户复述操作对象与备注内容。
-3. **推荐闭环**：拉取 `--status assignedtome` 的 Bug → 修复 → `resolve <id> -c "已在 commit xxx 修复，请验证"`（解决后禅道会自动指回创建者验证）。
-4. 表格输出中"指派给/创建人"为禅道账号或真实姓名；状态为中文（激活/已解决/已关闭等）。
-5. 若报"无法连接"检查地址格式（应形如 `http://IP:端口/zentao`）；报 403 是账号权限不足；报"登录失败"重新执行 `zentao17 login`。
+2. **读 Bug 必须读全**：`zentao17 bug <id>` 的 steps 字段含 HTML 内嵌截图（`file-read-*.png` 的 img src，即测试员标注截图，定性前必须核对）；**历史评论与状态流转用 `zentao17 bug <id> --json` 的 `actions` 数组**（created/activated/resolved/评论，每条含 actor/date/comment/extra）。激活（activated）记录常是诉求的追加层，漏读会错认问题对象。只读 steps 不读 actions 等于没读全。
+3. **写操作前确认**：resolve/close/activate 属于写操作，执行前向用户复述操作对象与备注内容。**resolve/close 严格后置于代码推送**（先 resolve 后推送会造成状态失真）。推送闭环含两步：远端 develop 推送＋主 checkout 本地 develop 快进（合并协议第 9 步——用户在本地 develop 上验证；agent hook 自动执行 `scripts/sync-local-develop.sh`，收尾仍须核对本地 develop 新 HEAD）。
+4. **推荐闭环**：拉取 `--status assignedtome` 的 Bug → 修复 → 提交推送＋同步本地 develop → `resolve <id> -c "已在 commit xxx 修复，请验证"`（解决后禅道会自动指回创建者验证）。
+5. 表格输出中"指派给/创建人"为禅道账号或真实姓名；状态为中文（激活/已解决/已关闭等）。
+6. 若报"无法连接"检查地址格式（应形如 `http://IP:端口/zentao`）；报 403 是账号权限不足；报"登录失败"重新执行 `zentao17 login`。
+
+## 状态口径（批量统计/分析必读）
+
+- 状态链：active（激活）→ resolved（已解决待验证）→ closed（已关闭）；confirmed（已确认）介于其间；**activated = 修复后复测不通过被打回**——有 activated 历史的单子是"争议中"，不是"已解决"。
+- **列表与详情接口的状态可能不一致**（v1 API 实证：2026-10-24 #48217 列表接口 `bugs --execution` 返回 confirmed、详情接口 `bug <id>` 返回 active）。用列表做批量统计后，**对 S2/严重级与多轮陈单必须用 `bug <id>` 逐条复核状态与 actions**，仅凭列表 status 汇总会漏激活单、错报队列规模。
+- **反复 resolved→activated 的单**（如 #48217 两轮修复两轮打回）通常意味着根因未定位或存在诊断盲区——按"活问题"处理：看最后一条 activated 的评论/截图与最新指派，不要按已解决叙事；再次 resolve 前必须先解释"上轮为什么没修好"。
 
 ## 错误对照
 

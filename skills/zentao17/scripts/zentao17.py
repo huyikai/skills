@@ -10,6 +10,8 @@
   zentao17 resolve 123 --comment "已在 commit abc123 修复"
   zentao17 close 123 --comment "验证通过"
   zentao17 activate 123
+  zentao17 assign 123 --to 10267114 -c "转产品拍板"   # 转派（网页会话通道）
+  zentao17 comment 123 -c "进展更新..."               # 独立备注（网页会话通道）
 
 凭证来源优先级: 命令行参数 > 环境变量(ZENTAO_URL/ZENTAO_ACCOUNT/ZENTAO_PASSWORD) > ~/.config/zentao17/credentials.json
 """
@@ -331,6 +333,158 @@ def cmd_activate(args):
     print(f"Bug #{args.id} 已激活")
 
 
+# ---------------------------------------------------------------------------
+# 网页会话通道（assign / comment）
+# v1 API 在禅道 17.8 上不开放独立备注与转派（PUT /bugs/{id} 忽略 assignedTo/comment，
+# activate 路由 404），但网页路由 bug-assign-{id}.html 与 bug-view 页的备注表单支持——
+# 走 user-login 换 zentaosid 会话。凭证复用 login 已存的本地配置，不新增交互。
+WEB_COOKIE_FILE = CONFIG_DIR / "web-session.json"
+
+
+class WebClient:
+    """带 Cookie 的网页请求客户端（不自动跟随重定向，便于识别登录跳转）。"""
+
+    def __init__(self, base, insecure=False):
+        self.base = base
+        import http.cookiejar
+        self.jar = http.cookiejar.CookieJar()
+        handlers = [urllib.request.HTTPCookieProcessor(self.jar)]
+        if insecure:
+            handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+        self.opener = urllib.request.build_opener(*handlers)
+
+    def request(self, path, data=None, referer=None, xhr=False):
+        url = self.base + path
+        body = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
+        req = urllib.request.Request(url, data=body, method="POST" if data is not None else "GET")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        # 禅道 17 反 CSRF：无 Referer 的登录后请求会被渲染成访客首页。
+        req.add_header("Referer", self.base + (referer if referer else "/"))
+        if xhr:
+            req.add_header("X-Requested-With", "XMLHttpRequest")
+        req.add_header("User-Agent", "Mozilla/5.0 zentao17-cli/1.1")
+        try:
+            with self.opener.open(req, timeout=30) as resp:
+                return resp.status, resp.geturl(), resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.code, url, e.read().decode("utf-8", "replace")
+
+    def cookies(self):
+        return {c.name: c.value for c in self.jar}
+
+
+def web_logged_in(client):
+    """会话有效性判据：登录用户页含「退出」，访客首页没有（访客也会被渲染成首页而非登录页）。"""
+    status, final, body = client.request("/my.html")
+    return status == 200 and ("退出" in (body or "")) and len(body or "") > 1000
+
+
+def web_login(creds, insecure=False):
+    client = WebClient(creds["url"], insecure)
+    # 先 GET 一次拿初始 zentaosid，再提交登录表单。
+    # 禅道 17 实测要点：登录 POST 必须带 X-Requested-With（AJAX）才返回 success JSON，
+    # 否则静默无效；后续页面请求必须带 Referer，否则被渲染成访客首页。
+    client.request("/user-login.html")
+    status, final_url, body = client.request(
+        "/user-login.html",
+        data={"account": creds["account"], "password": creds["password"], "referer": "/"},
+        referer="/user-login.html",
+        xhr=True,
+    )
+    ok = isinstance(body, str) and '"success"' in body[:200]
+    if not ok or not web_logged_in(client):
+        hint = re.sub(r"<[^>]+>", "", (body or ""))[:120]
+        die(f"网页会话登录失败（{hint}）。请核对账号密码，或禅道开启了验证码/密码加密策略。")
+    cookies = client.cookies()
+    sid = cookies.get("zentaosid") or next(iter(cookies.values()), "")
+    if not sid:
+        die("网页会话登录失败：未取得 zentaosid Cookie。")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    WEB_COOKIE_FILE.write_text(
+        json.dumps({"base": creds["url"], "account": creds["account"], "zentaosid": sid}),
+        encoding="utf-8")
+    WEB_COOKIE_FILE.chmod(0o600)
+    return client
+
+
+def web_client(creds, insecure=False, force_login=False):
+    """优先复用已存网页会话；失效（被跳回登录页）则自动重登一次。"""
+    if not (creds["url"] and creds["account"] and creds["password"]):
+        die("尚未配置登录信息。请先执行: zentao17 login")
+    if not force_login and WEB_COOKIE_FILE.exists():
+        try:
+            saved = json.loads(WEB_COOKIE_FILE.read_text(encoding="utf-8"))
+            if saved.get("base") == creds["url"] and saved.get("account") == creds["account"]:
+                import http.cookiejar
+                client = WebClient(creds["url"], insecure)
+                client.jar.set_cookie(http.cookiejar.Cookie(
+                    version=0, name="zentaosid", value=saved["zentaosid"],
+                    port=None, port_specified=False, domain="", domain_specified=False,
+                    domain_initial_dot=False, path="/", path_specified=True, secure=False,
+                    expires=None, discard=True, comment=None, comment_url=None,
+                    rest={"HttpOnly": None}, rfc2109=False))
+                if web_logged_in(client):
+                    return client
+        except Exception:
+            pass
+    return web_login(creds, insecure)
+
+
+def cmd_assign(args):
+    creds = load_creds()
+    client = web_client(creds, args.insecure)
+    # 禅道 17 的转派路由是 bug-assignTo（bug-assign 为空响应），表单含
+    # assignedTo/status/mailto[]/comment 四字段；onlybody 仅为弹窗展示参数。
+    form_path = f"/bug-assignTo-{args.id}.html"
+    view_path = f"/bug-view-{args.id}.html"
+    status, final, body = client.request(f"{form_path}?onlybody=yes", referer=view_path)
+    if status != 200 or len(body or "") < 200:
+        client = web_login(creds, args.insecure)
+        status, final, body = client.request(f"{form_path}?onlybody=yes", referer=view_path)
+    if len(body or "") < 200:
+        die(f"转派表单获取失败（HTTP {status}），请确认 Bug 编号与账号权限。")
+    status, final, body = client.request(
+        form_path,
+        data={"assignedTo": args.to, "status": "active", "mailto[]": "", "comment": args.comment or ""},
+        referer=view_path,
+    )
+    if status >= 400:
+        die(f"转派请求失败(HTTP {status})，请确认账号有该 Bug 的编辑权限。")
+    # 用 v1 API 回读复核（自验证，不凭网页响应猜）。
+    data = api("GET", f"/bugs/{args.id}", insecure=args.insecure)
+    bug = data.get("bug", data)
+    assigned = bug.get("assignedTo")
+    assigned = assigned.get("account") if isinstance(assigned, dict) else assigned
+    if str(assigned) != str(args.to):
+        die(f"转派未生效（当前仍指派给 {assigned}）。请人工在网页核对。")
+    print(f"Bug #{args.id} 已转派给 {args.to}" + (f"，备注: {args.comment}" if args.comment else ""))
+
+
+def cmd_comment(args):
+    creds = load_creds()
+    client = web_client(creds, args.insecure)
+    view_path = f"/bug-view-{args.id}.html"
+    # 禅道 17 备注路由：action-comment-bug-{id}.html（bug-view 页备注表单的 action）。
+    status, final, body = client.request(
+        f"/action-comment-bug-{args.id}.html",
+        data={"comment": args.comment},
+        referer=view_path,
+        xhr=True,
+    )
+    if status >= 400:
+        die(f"备注请求失败(HTTP {status})，请确认账号有该 Bug 的查看/备注权限。")
+    # 回读 actions 复核：最后一条 action 的 comment 应包含提交文本的开头。
+    data = api("GET", f"/bugs/{args.id}", insecure=args.insecure)
+    bug = data.get("bug", data)
+    actions = bug.get("actions") or []
+    head = (args.comment or "").strip()[:20]
+    ok = any(head and head in (a.get("comment") or "") for a in actions[-5:])
+    if not ok:
+        die("备注可能未写入（actions 未检到新评论），请人工在网页核对。")
+    who = actions[-1].get("actor") if actions else "?"
+    print(f"Bug #{args.id} 已添加备注（by {who}）: { (args.comment or '')[:50] }...")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="zentao17", description="禅道 17.x 命令行工具(v1 RESTful API)，拉取/解决/关闭 Bug",
                                      formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -401,6 +555,17 @@ def main():
     p.add_argument("--assign", help="激活后指派给")
     p.add_argument("--build", help="影响版本")
     p.set_defaults(func=cmd_activate)
+
+    p = sub.add_parser("assign", help="转派 Bug（网页会话通道，凭证复用 login）")
+    p.add_argument("id", type=int)
+    p.add_argument("--to", required=True, help="目标账号（工号，如 10267114）")
+    p.add_argument("-c", "--comment", help="转派备注")
+    p.set_defaults(func=cmd_assign)
+
+    p = sub.add_parser("comment", help="给 Bug 添加备注（网页会话通道，凭证复用 login）")
+    p.add_argument("id", type=int)
+    p.add_argument("-c", "--comment", required=True, help="备注内容")
+    p.set_defaults(func=cmd_comment)
 
     args = parser.parse_args()
     if args.cmd != "login" and not hasattr(args, "insecure"):
