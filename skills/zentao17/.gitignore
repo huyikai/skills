@@ -1,2 +1,3 @@
 LOCAL.md
 .DS_Store
+__pycache__/

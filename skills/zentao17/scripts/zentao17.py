@@ -3,25 +3,39 @@
 
 用法示例:
   zentao17 login                          # 交互式配置服务地址与账号
+  zentao17 whoami                         # 当前操作账号（工号＋姓名；actions 的 actor 是姓名）
   zentao17 products                       # 查看产品列表（获取产品 ID）
-  zentao17 bugs --product 1               # 某产品的 Bug 列表
-  zentao17 bugs --product 1 --status unclosed --limit 50
-  zentao17 bug 123                        # Bug 详情
+  zentao17 bugs --product 1               # 某产品的未关闭 Bug（产品级默认即未关闭口径）
+  zentao17 bugs --execution 5 --status unclosed --keyword 店舗  # 状态与关键词均在客户端过滤
+  zentao17 bug 123                        # Bug 详情：步骤文本＋截图清单＋actions 全历史
+  zentao17 download 123 --dir /tmp/x      # 下载步骤截图与附件
+  zentao17 changes --product 1 --state s.json        # 巡检预检：与上次快照比对
   zentao17 resolve 123 --comment "已在 commit abc123 修复"
   zentao17 close 123 --comment "验证通过"
-  zentao17 activate 123
-  zentao17 assign 123 --to 10267114 -c "转产品拍板"   # 转派（网页会话通道）
+  zentao17 activate 123 -c "误解决，重新激活"         # 激活（网页会话通道）
+  zentao17 assign 123 --to 10267114 -c "转产品拍板"   # 转派（网页会话通道，保留原状态）
   zentao17 comment 123 -c "进展更新..."               # 独立备注（网页会话通道）
+  zentao17 users --search 孙杰                        # 查账号
+
+写命令（resolve/close/activate/assign/comment）一律写后回读 actions 自验证，退出码:
+  0 已生效（或目标状态已满足、未重复执行）  1 一般错误/服务端拒绝
+  3 回读确认未生效（可核对后重试）          4 结果未知（网络中断且回读失败，切勿直接重试）
 
 凭证来源优先级: 命令行参数 > 环境变量(ZENTAO_URL/ZENTAO_ACCOUNT/ZENTAO_PASSWORD) > ~/.config/zentao17/credentials.json
 """
 import argparse
 import getpass
+import html
+import http.client
 import json
 import os
 import re
+import signal
+import socket
 import ssl
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,6 +51,21 @@ RESOLUTION_NAMES = {
     "fixed": "已解决", "notrepro": "无法重现", "bydesign": "设计如此", "duplicate": "重复Bug",
     "external": "外部原因", "postponed": "延期处理", "willnotfix": "不予解决", "tostory": "转为需求",
 }
+
+EXIT_NOT_APPLIED = 3
+EXIT_UNKNOWN = 4
+
+# 读请求遇到这些错误自动重试；写请求不重试，交给写后回读判定。
+NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, http.client.HTTPException)
+GET_RETRIES = 3
+
+
+class NetworkError(Exception):
+    """连接失败、超时、连接被重置——请求是否到达服务端未知。"""
+
+
+class ApiError(Exception):
+    """服务端明确返回错误（HTTP 4xx/5xx）。"""
 
 
 def die(msg, code=1):
@@ -79,27 +108,35 @@ def normalize_base(url):
     return url
 
 
+def ssl_context(insecure):
+    return ssl._create_unverified_context() if insecure else None
+
+
 def http(method, base, path, body=None, token=None, insecure=False):
     url = base + API + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Content-Type", "application/json")
-    if token:
-        req.add_header("Token", token)
-    ctx = ssl._create_unverified_context() if insecure else None
-    try:
-        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-            return resp.status, (json.loads(raw) if raw.strip() else None)
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", "replace")
+    attempts = GET_RETRIES if method == "GET" else 1
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Content-Type", "application/json")
+        if token:
+            req.add_header("Token", token)
         try:
-            return e.code, json.loads(raw)
-        except Exception:
-            return e.code, raw
-    except urllib.error.URLError as e:
-        reason = getattr(e, "reason", e)
-        die(f"无法连接禅道服务({url}): {reason}\n请检查地址是否正确、网络是否可达")
+            with urllib.request.urlopen(req, timeout=30, context=ssl_context(insecure)) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+                return resp.status, (json.loads(raw) if raw.strip() else None)
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "replace")
+            try:
+                return e.code, json.loads(raw)
+            except Exception:
+                return e.code, raw
+        except NETWORK_ERRORS as e:
+            if attempt < attempts:
+                time.sleep(1.5 * attempt)
+                continue
+            reason = getattr(e, "reason", None) or e
+            raise NetworkError(f"{method} {url}: {reason}")
 
 
 def fetch_token(creds, insecure, force=False):
@@ -139,12 +176,12 @@ def api(method, path, body=None, params=None, insecure=False):
         token = fetch_token(creds, insecure, force=True)
         status, data = http(method, creds["url"], path, body, token, insecure)
     if status == 404:
-        die(f"接口不存在(HTTP 404): {path}\n请确认禅道版本支持 v1 API(>= 12.0)")
+        raise ApiError(f"接口不存在(HTTP 404): {path}\n请确认禅道版本支持 v1 API(>= 12.0)")
     if status == 403:
-        die("无权限(HTTP 403): 当前账号对目标对象/产品没有操作权限")
+        raise ApiError("无权限(HTTP 403): 当前账号对目标对象/产品没有操作权限")
     if status >= 400:
         msg = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
-        die(f"请求失败(HTTP {status}): {msg}")
+        raise ApiError(f"请求失败(HTTP {status}): {msg}")
     return data
 
 
@@ -172,12 +209,73 @@ def table(rows, headers):
         print(fmt(line))
 
 
-def strip_html(html):
-    if not html:
+IMG_RE = re.compile(r"<img\b[^>]*?\bsrc=['\"]([^'\"]+)['\"][^>]*>", re.I)
+
+
+def strip_html(text, images=None):
+    """HTML → 纯文本。传入 images 列表时，<img> 替换为 [图N] 并把 src 依次追加进列表。"""
+    if not text:
         return ""
-    text = re.sub(r"<br\s*/?>", "\n", html)
+    def img(m):
+        if images is None:
+            return ""
+        images.append(m.group(1))
+        return f"[图{len(images)}]"
+    text = IMG_RE.sub(img, text)
+    text = re.sub(r"<br\s*/?>|</p>|</div>|</li>|</tr>|</h\d>", "\n", text, flags=re.I)
     text = re.sub(r"<[^>]+>", "", text)
-    return text.replace("&nbsp;", " ").replace("&lt;", "<").replace("&gt;", ">").strip()
+    text = html.unescape(text).replace("\xa0", " ")
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def norm_text(text):
+    """比对用：去标签、反转义、折叠空白。"""
+    return re.sub(r"\s+", " ", strip_html(text or "")).strip()
+
+
+def account_of(user):
+    if isinstance(user, dict):
+        return str(user.get("account") or "")
+    return str(user or "")
+
+
+def who(user):
+    if isinstance(user, dict):
+        return user.get("realname") or user.get("account") or ""
+    return str(user or "")
+
+
+def who_full(user):
+    if isinstance(user, dict):
+        name, acc = user.get("realname"), user.get("account")
+        return f"{name}({acc})" if name and acc else (name or acc or "")
+    return str(user or "")
+
+
+def get_bug(bug_id, insecure):
+    data = api("GET", f"/bugs/{bug_id}", insecure=insecure)
+    return data.get("bug", data) if isinstance(data, dict) else {}
+
+
+def bug_actions(bug):
+    acts = bug.get("actions") or []
+    return sorted(acts, key=lambda a: int(a.get("id") or 0))
+
+
+def last_action_id(bug):
+    return max((int(a.get("id") or 0) for a in bug.get("actions") or []), default=0)
+
+
+_ME = {}
+
+
+def whoami(insecure):
+    if not _ME:
+        data = api("GET", "/user", insecure=insecure)
+        prof = data.get("profile", data) if isinstance(data, dict) else {}
+        _ME.update(prof or {})
+    return _ME
 
 
 def cmd_login(args):
@@ -193,6 +291,37 @@ def cmd_login(args):
     save_creds(url, account, password)
     fetch_token({"url": url, "account": account, "password": password}, args.insecure, force=True)
     print(f"登录成功，凭证已保存到 {CRED_FILE}")
+
+
+def cmd_whoami(args):
+    me = whoami(args.insecure)
+    role = me.get("role")
+    role = role.get("name") if isinstance(role, dict) else role
+    if args.json:
+        print(json.dumps({"id": me.get("id"), "account": me.get("account"), "realname": me.get("realname"),
+                          "role": role}, ensure_ascii=False))
+        return
+    print(f"{me.get('account')} {me.get('realname')}" + (f"（{role}）" if role else ""))
+
+
+def cmd_users(args):
+    users, page = [], 1
+    while page < 100:
+        data = api("GET", "/users", params={"limit": 100, "page": page}, insecure=args.insecure)
+        batch = data.get("users", []) if isinstance(data, dict) else []
+        users.extend(batch)
+        if not batch or len(users) >= int(data.get("total") or 0):
+            break
+        page += 1
+    if args.search:
+        kw = args.search.lower()
+        users = [u for u in users if kw in str(u.get("account", "")).lower() or kw in str(u.get("realname", "")).lower()]
+    if args.json:
+        print(json.dumps(users, ensure_ascii=False, indent=2))
+        return
+    table([{"账号": u.get("account"), "姓名": u.get("realname"),
+            "角色": (u.get("role") or {}).get("name") if isinstance(u.get("role"), dict) else u.get("role", "")}
+           for u in users], ["账号", "姓名", "角色"])
 
 
 def cmd_products(args):
@@ -249,100 +378,424 @@ def cmd_executions(args):
           ["ID", "名称", "编号", "状态", "起止"])
 
 
-def cmd_bugs(args):
-    params = {"order": args.order, "limit": args.limit, "page": args.page}
-    if args.status:
-        params["status"] = args.status
-    if args.execution:
-        path = f"/executions/{args.execution}/bugs"
-    elif args.project:
-        path = f"/projects/{args.project}/bugs"
-    elif args.product:
-        path = "/bugs"
+# ---------------------------------------------------------------------------
+# Bug 列表
+# 实测（2026-10-28，禅道 17.8）：执行级 /executions/{id}/bugs 忽略 status 参数（unclosed 也返回已关闭单）；
+# 产品级 /bugs?product= 默认只返回未关闭单，status=all 才含已关闭；列表的 status 会出现 confirmed
+# （＝激活且已确认，详情接口对同一单返回 active）。因此状态与「我的」类筛选一律在客户端执行。
+STATE_FILTERS = {
+    "unclosed": lambda b: b.get("status") != "closed",
+    "active": lambda b: b.get("status") in ("active", "confirmed"),
+    "confirmed": lambda b: b.get("status") == "confirmed" or str(b.get("confirmed")) == "1" and b.get("status") == "active",
+    "resolved": lambda b: b.get("status") == "resolved",
+    "closed": lambda b: b.get("status") == "closed",
+}
+MINE_FILTERS = {"assignedtome": "assignedTo", "openedbyme": "openedBy", "resolvedbyme": "resolvedBy"}
+
+
+def list_bugs(scope, scope_id, status=None, order="id_desc", limit=20, page=1, all_pages=False,
+              keywords=None, assigned=None, insecure=False):
+    """返回 (bugs, total, notes)。有客户端筛选时自动取全部页，保证结果完整。"""
+    params = {"order": order}
+    if scope == "execution":
+        path = f"/executions/{scope_id}/bugs"
+    elif scope == "project":
+        path = f"/projects/{scope_id}/bugs"
     else:
-        die("必须指定范围: --execution <执行ID> / --project <项目ID> / --product <产品ID>")
-    if args.product:
-        params["product"] = args.product
-    data = api("GET", path, params=params, insecure=args.insecure)
-    if args.all:  # 自动翻页取全部
-        all_bugs = data.get("bugs", []) if isinstance(data, dict) else []
-        total = data.get("total", len(all_bugs)) if isinstance(data, dict) else len(all_bugs)
-        page = args.page
-        while all_bugs and len(all_bugs) < int(total or 0) and page < 100:
-            page += 1
-            params["page"] = page
-            more = api("GET", path, params=params, insecure=args.insecure)
+        path = "/bugs"
+        params["product"] = scope_id
+    notes = []
+    client_filter = bool(keywords or assigned or (status and status != "all"))
+    if status == "all" or status == "closed":
+        params["status"] = "all"
+    elif status and status not in STATE_FILTERS and status not in MINE_FILTERS:
+        params["status"] = status  # 未知筛选值原样交给服务端
+    if client_filter:
+        all_pages = True
+        notes.append("筛选在客户端执行，已取全部页")
+    params["limit"] = max(limit, 100) if all_pages else limit
+    params["page"] = page
+    data = api("GET", path, params=params, insecure=insecure)
+    bugs = data.get("bugs", []) if isinstance(data, dict) else []
+    total = int(data.get("total", len(bugs)) or 0) if isinstance(data, dict) else len(bugs)
+    if all_pages:
+        cur = page
+        while bugs and len(bugs) < total and cur < 100:
+            cur += 1
+            params["page"] = cur
+            more = api("GET", path, params=params, insecure=insecure)
             batch = more.get("bugs", []) if isinstance(more, dict) else []
             if not batch:
                 break
-            all_bugs.extend(batch)
-        data = {"page": 1, "total": len(all_bugs), "limit": len(all_bugs), "bugs": all_bugs}
-    bugs = data.get("bugs", []) if isinstance(data, dict) else []
+            bugs.extend(batch)
+        total = len(bugs)
+    if status in STATE_FILTERS:
+        bugs = [b for b in bugs if STATE_FILTERS[status](b)]
+    elif status in MINE_FILTERS:
+        me = account_of(whoami(insecure))
+        field = MINE_FILTERS[status]
+        bugs = [b for b in bugs if account_of(b.get(field)) == me and b.get("status") != "closed"]
+    if assigned:
+        target = account_of(whoami(insecure)) if assigned == "me" else assigned
+        bugs = [b for b in bugs if account_of(b.get("assignedTo")) == target]
+    if keywords:
+        kws = [k.lower() for k in keywords]
+        bugs = [b for b in bugs if any(k in str(b.get("title", "")).lower() for k in kws)]
+    if client_filter:
+        total = len(bugs)
+    return bugs, total, notes
+
+
+def status_label(b):
+    st = b.get("status")
+    if st == "confirmed":
+        return "激活(已确认)"
+    return b.get("statusName") or st
+
+
+def cmd_bugs(args):
+    if args.execution:
+        scope, sid = "execution", args.execution
+    elif args.project:
+        scope, sid = "project", args.project
+    elif args.product:
+        scope, sid = "product", args.product
+    else:
+        die("必须指定范围: --execution <执行ID> / --project <项目ID> / --product <产品ID>")
+    bugs, total, notes = list_bugs(scope, sid, args.status, args.order, args.limit, args.page, args.all,
+                                   args.keyword, args.assigned, args.insecure)
     if args.json:
-        print(json.dumps(data, ensure_ascii=False, indent=2))
+        print(json.dumps({"page": 1 if args.all or notes else args.page, "total": total, "limit": len(bugs),
+                          "notes": notes, "bugs": bugs}, ensure_ascii=False, indent=2))
         return
-    print(f"共 {data.get('total', len(bugs))} 条（第 {data.get('page', args.page)} 页，每页 {data.get('limit', args.limit)} 条）")
-    rows = [{"ID": b.get("id"), "状态": b.get("statusName") or b.get("status"), "严重": b.get("severity"),
-             "优先": b.get("pri"), "指派给": b.get("assignedTo"), "创建人": b.get("openedBy"), "标题": b.get("title")}
+    head = f"共 {total} 条"
+    head += f"（{'；'.join(notes)}）" if notes else ("（已取全部页）" if args.all else f"（第 {args.page} 页，每页 {args.limit} 条）")
+    print(head)
+    rows = [{"ID": b.get("id"), "状态": status_label(b), "严重": b.get("severity"),
+             "优先": b.get("pri"), "指派给": who(b.get("assignedTo")), "创建人": who(b.get("openedBy")),
+             "标题": b.get("title")}
             for b in bugs]
     table(rows, ["ID", "状态", "严重", "优先", "指派给", "创建人", "标题"])
 
 
-def cmd_bug(args):
-    data = api("GET", f"/bugs/{args.id}", insecure=args.insecure)
-    if args.json:
-        print(json.dumps(data, ensure_ascii=False, indent=2))
-        return
-    bug = data.get("bug", data) if isinstance(data, dict) else {}
-    keys = ["id", "title", "severity", "pri", "status", "statusName", "assignedTo", "openedBy", "openedDate",
-            "resolvedBy", "resolvedDate", "resolution", "closedBy", "closedDate", "type", "steps"]
-    for k in keys:
-        if k not in bug:
+# ---------------------------------------------------------------------------
+# Bug 详情：一次给全「步骤文本＋截图清单＋附件＋actions 全历史」，不必再读 --json
+def bug_media(bug, base):
+    images = []
+    steps = strip_html(bug.get("steps") or "", images)
+    urls = [urllib.parse.urljoin(base + "/", src) for src in images]
+    files = []
+    for f in bug.get("files") or []:
+        if not isinstance(f, dict) or not f.get("id"):
             continue
-        v = bug[k]
-        if k == "steps":
-            v = strip_html(v)
-        if v not in (None, ""):
-            print(f"{k:>14}: {v}")
+        ext = f.get("extension") or "bin"
+        files.append({"title": f.get("title") or f"file-{f['id']}.{ext}",
+                      "url": urllib.parse.urljoin(base + "/", f"file-read-{f['id']}.{ext}")})
+    return steps, urls, files
+
+
+HISTORY_NOISE = {"resolvedBuild", "resolvedBy", "activatedCount", "lastEditedBy", "closedBy"}
+
+
+def format_history(hist):
+    """只列影响判断的字段变化；日期、计数、解决人（＝actor）等随动字段略去。"""
+    if isinstance(hist, str):
+        try:
+            hist = json.loads(hist)
+        except Exception:
+            return []
+    out = []
+    for h in hist or []:
+        if not isinstance(h, dict):
+            continue
+        field = h.get("field")
+        if field in HISTORY_NOISE or str(field).endswith("Date"):
+            continue
+        if field in ("steps",):
+            out.append(f"{field} 已修改")
+            continue
+        old, new = norm_text(str(h.get("old") or "")), norm_text(str(h.get("new") or ""))
+        out.append(f"{field}: {old[:60] or '∅'} → {new[:60] or '∅'}")
+    return out
+
+
+def cmd_bug(args):
+    bug = get_bug(args.id, args.insecure)
+    if args.json:
+        print(json.dumps(bug, ensure_ascii=False, indent=2))
+        return
+    base = load_creds()["url"]
+    steps, images, files = bug_media(bug, base)
+    print(f"#{bug.get('id')} {bug.get('title')}")
+    print(f"状态: {bug.get('status')}" + (f"（已确认）" if str(bug.get("confirmed")) == "1" and bug.get("status") == "active" else "")
+          + f"  严重: {bug.get('severity')}  优先: {bug.get('pri')}  类型: {bug.get('type')}"
+          + f"  激活次数: {bug.get('activatedCount') or 0}")
+    print(f"指派给: {who_full(bug.get('assignedTo'))}  创建: {who_full(bug.get('openedBy'))} {bug.get('openedDate') or ''}")
+    if bug.get("resolvedBy"):
+        print(f"解决: {who_full(bug.get('resolvedBy'))} {bug.get('resolution') or ''} {bug.get('resolvedDate') or ''}")
+    if bug.get("closedBy"):
+        print(f"关闭: {who_full(bug.get('closedBy'))} {bug.get('closedDate') or ''}")
+    scope = [f"产品 {bug.get('product')} {bug.get('productName') or ''}".strip()]
+    if bug.get("execution"):
+        scope.append(f"执行 {bug.get('execution')} {bug.get('executionName') or ''}".strip())
+    if bug.get("moduleTitle"):
+        scope.append(f"模块 {bug.get('moduleTitle')}")
+    print("所属: " + " / ".join(scope))
+    print("\n--- 步骤 ---")
+    print(steps or "(空)")
+    if images or files:
+        print(f"\n--- 截图/附件（定性前必须核对；zentao17 download {bug.get('id')} 可下载）---")
+        for i, u in enumerate(images, 1):
+            print(f"[图{i}] {u}")
+        for f in files:
+            print(f"[附件] {f['title']} {f['url']}")
+    acts = bug_actions(bug)
+    print(f"\n--- 历史 actions（{len(acts)} 条，按时间；actor 为姓名）---")
+    for a in acts:
+        extra = f" → {a.get('extra')}" if a.get("extra") else ""
+        print(f"#{a.get('id')} {a.get('date')} {a.get('actor')} {a.get('action')}{extra}")
+        for line in format_history(a.get("history")):
+            print(f"    改动 {line}")
+        comment = strip_html(a.get("comment") or "")
+        if comment:
+            print("    备注: " + comment.replace("\n", "\n          "))
+
+
+def download(url, dest, insecure):
+    """附件实测无需登录即可读取；拿到 HTML（被要求登录）时改用网页会话重取。"""
+    for attempt in range(1, GET_RETRIES + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "zentao17-cli/1.2"})
+            with urllib.request.urlopen(req, timeout=60, context=ssl_context(insecure)) as resp:
+                ctype, data = resp.headers.get("Content-Type", ""), resp.read()
+            break
+        except NETWORK_ERRORS as e:
+            if attempt == GET_RETRIES:
+                raise NetworkError(f"GET {url}: {getattr(e, 'reason', None) or e}")
+            time.sleep(1.5 * attempt)
+    if "text/html" in ctype:
+        creds = load_creds()
+        client = web_client(creds, insecure)
+        path = urllib.parse.urlsplit(url).path
+        status, _, data = client.request(path, raw=True)
+        if status != 200 or data[:15].lower().startswith(b"<!doctype html") or data[:5].lower() == b"<html":
+            raise ApiError(f"附件下载失败（HTTP {status}）：{url}")
+    dest.write_bytes(data)
+    return len(data)
+
+
+def cmd_download(args):
+    bug = get_bug(args.id, args.insecure)
+    base = load_creds()["url"]
+    _, images, files = bug_media(bug, base)
+    if not images and not files:
+        print(f"Bug #{args.id} 没有截图或附件")
+        return
+    out = Path(args.dir) if args.dir else Path(tempfile.gettempdir()) / "zentao17-files" / str(args.id)
+    out.mkdir(parents=True, exist_ok=True)
+    targets = [(f"图{i}", u, Path(urllib.parse.urlsplit(u).path).name) for i, u in enumerate(images, 1)]
+    targets += [("附件", f["url"], re.sub(r"[/\\]", "_", f["title"])) for f in files]
+    for label, url, name in targets:
+        dest = out / (f"{label}-{name}" if label != "附件" else name)
+        size = download(url, dest, args.insecure)
+        print(f"[{label}] {dest}（{size} 字节）")
+
+
+# ---------------------------------------------------------------------------
+# 巡检预检：与上次快照比对，没有新单、跟踪单也没有新动作时，调用方可直接结束本轮。
+def fingerprint(bug):
+    return {"status": bug.get("status"), "assignedTo": account_of(bug.get("assignedTo")),
+            "lastAction": last_action_id(bug)}
+
+
+def parse_ids(text):
+    return [int(x) for x in re.split(r"[,\s]+", text or "") if x.strip()]
+
+
+def cmd_changes(args):
+    state_path = Path(args.state)
+    first = not state_path.exists()
+    state = {"version": 1, "product": args.product, "seen": [], "tracked": {}}
+    if not first:
+        try:
+            state.update(json.loads(state_path.read_text(encoding="utf-8")))
+        except Exception as e:
+            die(f"快照文件无法解析（{e}）：{state_path}。删除后重跑即重建基线。")
+    tracked = {int(k): v for k, v in (state.get("tracked") or {}).items()}
+    if args.set_tracked is not None:
+        keep = set(parse_ids(args.set_tracked))
+        tracked = {i: tracked.get(i) for i in keep}
+    for i in parse_ids(args.track):
+        tracked.setdefault(i, None)
+    for i in parse_ids(args.untrack):
+        tracked.pop(i, None)
+    seen = set(int(x) for x in state.get("seen") or [])
+
+    bugs, total, _ = list_bugs("product", args.product, "unclosed", all_pages=True, insecure=args.insecure)
+    unclosed = {int(b["id"]): b for b in bugs}
+    kws = [k.lower() for k in args.keyword or []]
+    new = [unclosed[i] for i in sorted(unclosed, reverse=True) if i not in seen]
+
+    # --own-prefix：actor 是本人姓名、且备注以该前缀开头的动作（自动代理自己的写操作）不算变化
+    me_name = whoami(args.insecure).get("realname") if args.own_prefix else None
+    prefix = norm_text(args.own_prefix) if args.own_prefix else None
+
+    def own(a):
+        return bool(prefix) and a.get("actor") == me_name and norm_text(a.get("comment")).startswith(prefix)
+
+    changed, gone, baseline, own_only, fps = [], [], [], [], {}
+    for i in sorted(tracked):
+        bug = get_bug(i, args.insecure)
+        fp = fingerprint(bug)
+        fps[i] = fp
+        old = tracked.get(i)
+        if fp["status"] == "closed":
+            gone.append((i, bug))
+        elif old is None:
+            baseline.append(i)
+        elif fp != old:
+            fresh = [a for a in bug_actions(bug) if int(a.get("id") or 0) > int(old.get("lastAction") or 0)]
+            if fresh and all(own(a) for a in fresh):
+                own_only.append(i)
+            else:
+                changed.append((i, old, fp, fresh))
+
+    result = {"first": first, "unclosed": len(unclosed),
+              "new": [{"id": int(b["id"]), "title": b.get("title"), "assignedTo": account_of(b.get("assignedTo")),
+                       "keywordHit": any(k in str(b.get("title", "")).lower() for k in kws)} for b in new],
+              "changed": [{"id": i, "before": o, "after": f,
+                           "actions": [{"id": a.get("id"), "date": a.get("date"), "actor": a.get("actor"),
+                                        "action": a.get("action"), "extra": a.get("extra"),
+                                        "comment": norm_text(a.get("comment"))[:120]} for a in acts]}
+                          for i, o, f, acts in changed],
+              "closed": [i for i, _ in gone], "baseline": baseline, "ownOnly": own_only}
+    has_change = bool(new or changed or gone)
+    result["result"] = "changed" if has_change else "none"
+
+    if args.update:
+        seen |= set(unclosed)
+        state.update({"product": args.product, "seen": sorted(seen),
+                      "tracked": {str(i): fps[i] for i in sorted(fps) if i not in dict(gone)}})
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_path.with_name(state_path.name + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, state_path)
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    print(f"预检 产品{args.product}：未关闭 {len(unclosed)} 条；新出现 {len(new)} 条；"
+          f"跟踪 {len(tracked)} 条中变化 {len(changed)}、已关闭 {len(gone)}、新纳入基线 {len(baseline)}"
+          + (f"、仅本方动作 {len(own_only)}（不计）" if own_only else "")
+          + ("（首次运行，全部视为新出现）" if first else ""))
+    for item in result["new"]:
+        hit = " [关键词命中]" if item["keywordHit"] else ""
+        print(f"NEW {item['id']}{hit} 指派 {item['assignedTo']} {item['title']}")
+    for i, o, f, acts in changed:
+        print(f"CHANGED {i} {o.get('status')}→{f['status']} 指派 {o.get('assignedTo')}→{f['assignedTo']}")
+        for a in acts:
+            c = norm_text(a.get("comment"))[:80]
+            print(f"    #{a.get('id')} {a.get('date')} {a.get('actor')} {a.get('action')}"
+                  + (f" → {a.get('extra')}" if a.get("extra") else "") + (f"：{c}" if c else ""))
+    for i, bug in gone:
+        print(f"CLOSED {i} {bug.get('title')}")
+    print(f"RESULT: {result['result']}" + ("（已更新快照）" if args.update else ""))
+
+
+# ---------------------------------------------------------------------------
+# 写命令：写后回读自验证。超时不等于失败——一律以回读的 actions 为准，避免重复写。
+def run_write(args, label, do_write, check, skip=None):
+    before = get_bug(args.id, args.insecure)
+    if skip:
+        msg = skip(before)
+        if msg:
+            print(f"Bug #{args.id} {msg}，未重复执行")
+            return
+    before_max = last_action_id(before)
+    failure = None
+    try:
+        do_write(before)
+    except NetworkError as e:
+        failure = ("network", str(e))
+    except ApiError as e:
+        failure = ("api", str(e))
+    try:
+        after = get_bug(args.id, args.insecure)
+    except (NetworkError, ApiError) as e:
+        state = "写请求中途出错" if failure else "写请求已发出"
+        die(f"Bug #{args.id} {label}结果未知：{state}，回读失败（{e}）。\n"
+            f"请稍后执行 zentao17 bug {args.id} 核对 actions，确认未生效后再重试；切勿直接重试。", EXIT_UNKNOWN)
+    fresh = [a for a in bug_actions(after) if int(a.get("id") or 0) > before_max]
+    ok, note = check(before, after, fresh)
+    if ok:
+        msg = f"Bug #{args.id} {note}"
+        if failure:
+            msg += f"（写请求曾报错：{failure[1]}；回读确认已生效，勿重试）"
+        print(msg)
+        return
+    if failure and failure[0] == "api":
+        die(failure[1])
+    reason = f"写请求网络中断（{failure[1]}）" if failure else "服务端已响应"
+    die(f"Bug #{args.id} {label}未生效：{reason}，回读未见对应变化（{note}）。核对后可重试。", EXIT_NOT_APPLIED)
+
+
+def has_action(fresh, *names):
+    return any(a.get("action") in names for a in fresh)
 
 
 def cmd_resolve(args):
     if args.resolution not in RESOLUTIONS:
         die(f"无效的解决方案: {args.resolution}，可选: {', '.join(RESOLUTIONS)}")
-    body = {"resolution": args.resolution, "resolvedBuild": args.build, "comment": args.comment or ""}
-    if args.assign:
-        body["assignedTo"] = args.assign
-    if args.resolution == "duplicate" and args.duplicate_bug:
-        body["duplicateBug"] = args.duplicate_bug
-    api("POST", f"/bugs/{args.id}/resolve", body=body, insecure=args.insecure)
-    print(f"Bug #{args.id} 已解决（{RESOLUTION_NAMES[args.resolution]}）" + (f"，备注: {args.comment}" if args.comment else ""))
+    if args.resolution == "duplicate" and not args.duplicate_bug:
+        die("resolution=duplicate 时必须给出 --duplicate-bug")
+
+    def skip(bug):
+        if bug.get("status") == "closed":
+            die(f"Bug #{args.id} 已关闭，不能 resolve")
+        if bug.get("status") == "resolved":
+            return f"已是已解决状态（{bug.get('resolution')}，by {who(bug.get('resolvedBy'))}）"
+
+    def write(_):
+        body = {"resolution": args.resolution, "resolvedBuild": args.build, "comment": args.comment or ""}
+        if args.assign:
+            body["assignedTo"] = args.assign
+        if args.resolution == "duplicate":
+            body["duplicateBug"] = args.duplicate_bug
+        api("POST", f"/bugs/{args.id}/resolve", body=body, insecure=args.insecure)
+
+    def check(_, after, fresh):
+        ok = after.get("status") == "resolved" and has_action(fresh, "resolved")
+        return ok, (f"已解决（{RESOLUTION_NAMES[args.resolution]}），指派给 {who(after.get('assignedTo'))}"
+                    + (f"，备注: {args.comment}" if args.comment else "")) if ok else f"当前状态 {after.get('status')}"
+
+    run_write(args, "解决", write, check, skip)
 
 
 def cmd_close(args):
-    api("POST", f"/bugs/{args.id}/close", body={"comment": args.comment or ""}, insecure=args.insecure)
-    print(f"Bug #{args.id} 已关闭" + (f"，备注: {args.comment}" if args.comment else ""))
+    def skip(bug):
+        if bug.get("status") == "closed":
+            return "已是已关闭状态"
 
+    def write(_):
+        api("POST", f"/bugs/{args.id}/close", body={"comment": args.comment or ""}, insecure=args.insecure)
 
-def cmd_activate(args):
-    body = {"comment": args.comment or ""}
-    if args.assign:
-        body["assignedTo"] = args.assign
-    if args.build:
-        body["openedBuild"] = args.build
-    api("POST", f"/bugs/{args.id}/activate", body=body, insecure=args.insecure)
-    print(f"Bug #{args.id} 已激活")
+    def check(_, after, fresh):
+        ok = after.get("status") == "closed" and has_action(fresh, "closed")
+        return ok, ("已关闭" + (f"，备注: {args.comment}" if args.comment else "")) if ok else f"当前状态 {after.get('status')}"
+
+    run_write(args, "关闭", write, check, skip)
 
 
 # ---------------------------------------------------------------------------
-# 网页会话通道（assign / comment）
-# v1 API 在禅道 17.8 上不开放独立备注与转派（PUT /bugs/{id} 忽略 assignedTo/comment，
-# activate 路由 404），但网页路由 bug-assign-{id}.html 与 bug-view 页的备注表单支持——
-# 走 user-login 换 zentaosid 会话。凭证复用 login 已存的本地配置，不新增交互。
+# 网页会话通道（activate / assign / comment）
+# v1 API 在禅道 17.8 上不开放激活、独立备注与转派（activate 路由 404；PUT /bugs/{id} 忽略
+# assignedTo/comment），改走网页路由：bug-activate / bug-assignTo / action-comment，
+# 用 user-login 换 zentaosid 会话。凭证复用 login 已存的本地配置，不新增交互。
 WEB_COOKIE_FILE = CONFIG_DIR / "web-session.json"
 
 
 class WebClient:
-    """带 Cookie 的网页请求客户端（不自动跟随重定向，便于识别登录跳转）。"""
+    """带 Cookie 的网页请求客户端。opener 会跟随重定向，登录态以 /my.html 是否含「退出」判定。"""
 
     def __init__(self, base, insecure=False):
         self.base = base
@@ -353,21 +806,32 @@ class WebClient:
             handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
         self.opener = urllib.request.build_opener(*handlers)
 
-    def request(self, path, data=None, referer=None, xhr=False):
+    def request(self, path, data=None, referer=None, xhr=False, raw=False):
+        """data 可为 dict 或 (键, 值) 列表（多值字段如 openedBuild[]）。GET 自动重试，POST 不重试。"""
         url = self.base + path
         body = urllib.parse.urlencode(data).encode("utf-8") if data is not None else None
-        req = urllib.request.Request(url, data=body, method="POST" if data is not None else "GET")
-        req.add_header("Content-Type", "application/x-www-form-urlencoded")
-        # 禅道 17 反 CSRF：无 Referer 的登录后请求会被渲染成访客首页。
-        req.add_header("Referer", self.base + (referer if referer else "/"))
-        if xhr:
-            req.add_header("X-Requested-With", "XMLHttpRequest")
-        req.add_header("User-Agent", "Mozilla/5.0 zentao17-cli/1.1")
-        try:
-            with self.opener.open(req, timeout=30) as resp:
-                return resp.status, resp.geturl(), resp.read().decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            return e.code, url, e.read().decode("utf-8", "replace")
+        method = "POST" if data is not None else "GET"
+        attempts = GET_RETRIES if method == "GET" else 1
+        for attempt in range(1, attempts + 1):
+            req = urllib.request.Request(url, data=body, method=method)
+            req.add_header("Content-Type", "application/x-www-form-urlencoded")
+            # 禅道 17 反 CSRF：无 Referer 的登录后请求会被渲染成访客首页。
+            req.add_header("Referer", self.base + (referer if referer else "/"))
+            if xhr:
+                req.add_header("X-Requested-With", "XMLHttpRequest")
+            req.add_header("User-Agent", "Mozilla/5.0 zentao17-cli/1.2")
+            try:
+                with self.opener.open(req, timeout=30) as resp:
+                    content = resp.read()
+                    return resp.status, resp.geturl(), content if raw else content.decode("utf-8", "replace")
+            except urllib.error.HTTPError as e:
+                content = e.read()
+                return e.code, url, content if raw else content.decode("utf-8", "replace")
+            except NETWORK_ERRORS as e:
+                if attempt < attempts:
+                    time.sleep(1.5 * attempt)
+                    continue
+                raise NetworkError(f"{method} {url}: {getattr(e, 'reason', None) or e}")
 
     def cookies(self):
         return {c.name: c.value for c in self.jar}
@@ -425,64 +889,119 @@ def web_client(creds, insecure=False, force_login=False):
                     rest={"HttpOnly": None}, rfc2109=False))
                 if web_logged_in(client):
                     return client
+        except NetworkError:
+            raise
         except Exception:
             pass
     return web_login(creds, insecure)
 
 
+def web_form(creds, insecure, form_path, view_path):
+    """取弹窗表单（onlybody 仅为展示参数），会话失效时重登一次。"""
+    client = web_client(creds, insecure)
+    status, _, body = client.request(f"{form_path}?onlybody=yes", referer=view_path)
+    if status != 200 or len(body or "") < 200:
+        client = web_login(creds, insecure)
+        status, _, body = client.request(f"{form_path}?onlybody=yes", referer=view_path)
+    if len(body or "") < 200:
+        raise ApiError(f"表单获取失败（HTTP {status}）：{form_path}，请确认 Bug 编号与账号权限")
+    return client, body
+
+
+def form_input_value(body, name):
+    for tag in re.findall(r"<input\b[^>]*>", body or ""):
+        if re.search(rf"\bname=['\"]{re.escape(name)}['\"]", tag):
+            m = re.search(r"\bvalue=['\"]([^'\"]*)['\"]", tag)
+            return html.unescape(m.group(1)) if m else ""
+    return None
+
+
+def form_selected(body, name):
+    m = re.search(rf"<select\b[^>]*\bname=['\"]{re.escape(name)}['\"][\s\S]*?</select>", body or "")
+    if not m:
+        return []
+    return [html.unescape(v) for v in re.findall(r"<option\b[^>]*\bvalue=['\"]([^'\"]*)['\"][^>]*\bselected", m.group(0)) if v]
+
+
+def cmd_activate(args):
+    creds = load_creds()
+    form_path, view_path = f"/bug-activate-{args.id}.html", f"/bug-view-{args.id}.html"
+
+    def skip(bug):
+        if bug.get("status") == "active":
+            return "已是激活状态"
+
+    def write(_):
+        client, body = web_form(creds, args.insecure, form_path, view_path)
+        # 表单默认：指派给上次解决人、影响版本沿用原值；status 为隐藏字段 active。
+        assigned = args.assign or (form_selected(body, "assignedTo") or [""])[0]
+        builds = [args.build] if args.build else (form_selected(body, "openedBuild[]") or ["trunk"])
+        data = [("assignedTo", assigned), ("status", "active"), ("comment", args.comment or "")]
+        data += [("openedBuild[]", b) for b in builds]
+        status, _, _ = client.request(form_path, data=data, referer=view_path)
+        if status >= 400:
+            raise ApiError(f"激活请求失败(HTTP {status})，请确认账号有该 Bug 的编辑权限")
+
+    def check(_, after, fresh):
+        ok = after.get("status") == "active" and has_action(fresh, "activated")
+        return ok, (f"已激活，指派给 {who(after.get('assignedTo'))}"
+                    + (f"，备注: {args.comment}" if args.comment else "")) if ok else f"当前状态 {after.get('status')}"
+
+    run_write(args, "激活", write, check, skip)
+
+
 def cmd_assign(args):
     creds = load_creds()
-    client = web_client(creds, args.insecure)
-    # 禅道 17 的转派路由是 bug-assignTo（bug-assign 为空响应），表单含
-    # assignedTo/status/mailto[]/comment 四字段；onlybody 仅为弹窗展示参数。
-    form_path = f"/bug-assignTo-{args.id}.html"
-    view_path = f"/bug-view-{args.id}.html"
-    status, final, body = client.request(f"{form_path}?onlybody=yes", referer=view_path)
-    if status != 200 or len(body or "") < 200:
-        client = web_login(creds, args.insecure)
-        status, final, body = client.request(f"{form_path}?onlybody=yes", referer=view_path)
-    if len(body or "") < 200:
-        die(f"转派表单获取失败（HTTP {status}），请确认 Bug 编号与账号权限。")
-    status, final, body = client.request(
-        form_path,
-        data={"assignedTo": args.to, "status": "active", "mailto[]": "", "comment": args.comment or ""},
-        referer=view_path,
-    )
-    if status >= 400:
-        die(f"转派请求失败(HTTP {status})，请确认账号有该 Bug 的编辑权限。")
-    # 用 v1 API 回读复核（自验证，不凭网页响应猜）。
-    data = api("GET", f"/bugs/{args.id}", insecure=args.insecure)
-    bug = data.get("bug", data)
-    assigned = bug.get("assignedTo")
-    assigned = assigned.get("account") if isinstance(assigned, dict) else assigned
-    if str(assigned) != str(args.to):
-        die(f"转派未生效（当前仍指派给 {assigned}）。请人工在网页核对。")
-    print(f"Bug #{args.id} 已转派给 {args.to}" + (f"，备注: {args.comment}" if args.comment else ""))
+    form_path, view_path = f"/bug-assignTo-{args.id}.html", f"/bug-view-{args.id}.html"
+
+    def write(before):
+        client, body = web_form(creds, args.insecure, form_path, view_path)
+        # 表单的隐藏字段 status 是单子当前状态，必须原样回传；
+        # 写死 active 会把已解决的单在转派时悄悄改回激活（2026-10-28 实测表单结构）。
+        keep = form_input_value(body, "status") or before.get("status") or "active"
+        status, _, _ = client.request(
+            form_path,
+            data={"assignedTo": args.to, "status": keep, "mailto[]": "", "comment": args.comment or ""},
+            referer=view_path,
+        )
+        if status >= 400:
+            raise ApiError(f"转派请求失败(HTTP {status})，请确认账号有该 Bug 的编辑权限")
+
+    def check(before, after, fresh):
+        assigned = account_of(after.get("assignedTo"))
+        if assigned != str(args.to) or not fresh:
+            return False, f"当前仍指派给 {assigned or '?'}"
+        note = f"已转派给 {who_full(after.get('assignedTo'))}" + (f"，备注: {args.comment}" if args.comment else "")
+        if after.get("status") != before.get("status"):
+            note += f"（注意：状态 {before.get('status')}→{after.get('status')}）"
+        return True, note
+
+    run_write(args, "转派", write, check)
 
 
 def cmd_comment(args):
     creds = load_creds()
-    client = web_client(creds, args.insecure)
     view_path = f"/bug-view-{args.id}.html"
-    # 禅道 17 备注路由：action-comment-bug-{id}.html（bug-view 页备注表单的 action）。
-    status, final, body = client.request(
-        f"/action-comment-bug-{args.id}.html",
-        data={"comment": args.comment},
-        referer=view_path,
-        xhr=True,
-    )
-    if status >= 400:
-        die(f"备注请求失败(HTTP {status})，请确认账号有该 Bug 的查看/备注权限。")
-    # 回读 actions 复核：最后一条 action 的 comment 应包含提交文本的开头。
-    data = api("GET", f"/bugs/{args.id}", insecure=args.insecure)
-    bug = data.get("bug", data)
-    actions = bug.get("actions") or []
-    head = (args.comment or "").strip()[:20]
-    ok = any(head and head in (a.get("comment") or "") for a in actions[-5:])
-    if not ok:
-        die("备注可能未写入（actions 未检到新评论），请人工在网页核对。")
-    who = actions[-1].get("actor") if actions else "?"
-    print(f"Bug #{args.id} 已添加备注（by {who}）: { (args.comment or '')[:50] }...")
+    head = norm_text(args.comment)[:30]
+    if not head:
+        die("备注内容不能为空")
+
+    def write(_):
+        client = web_client(creds, args.insecure)
+        # 禅道 17 备注路由：action-comment-bug-{id}.html（bug-view 页备注表单的 action）。
+        status, _, _ = client.request(f"/action-comment-bug-{args.id}.html", data={"comment": args.comment},
+                                      referer=view_path, xhr=True)
+        if status >= 400:
+            raise ApiError(f"备注请求失败(HTTP {status})，请确认账号有该 Bug 的查看/备注权限")
+
+    def check(_, after, fresh):
+        # 只认本次新增的 action，旧的同文备注不算；禅道会转义/包裹 HTML，比对前先归一化。
+        hit = [a for a in fresh if head in norm_text(a.get("comment"))]
+        if not hit:
+            return False, "actions 未检到新备注"
+        return True, f"已添加备注（by {hit[-1].get('actor')}）: {args.comment[:50]}..."
+
+    run_write(args, "备注", write, check)
 
 
 def main():
@@ -496,6 +1015,15 @@ def main():
     p.add_argument("-u", "--account", help="账号")
     p.add_argument("-p", "--password", help="密码（建议交互输入，避免留在 shell 历史里）")
     p.set_defaults(func=cmd_login)
+
+    p = sub.add_parser("whoami", help="当前操作账号（工号＋姓名）")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_whoami)
+
+    p = sub.add_parser("users", help="用户列表（查账号/工号）")
+    p.add_argument("--search", help="按账号或姓名搜索")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_users)
 
     p = sub.add_parser("products", help="产品列表")
     p.add_argument("--json", action="store_true")
@@ -518,22 +1046,42 @@ def main():
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_executions)
 
-    p = sub.add_parser("bugs", help="Bug 列表")
-    p.add_argument("--product", type=int, help="产品 ID（过滤用，或单独作范围）")
-    p.add_argument("--execution", type=int, help="执行 ID（与 --project 二选一）")
+    p = sub.add_parser("bugs", help="Bug 列表（状态/关键词/指派筛选在客户端执行）")
+    p.add_argument("--product", type=int, help="产品 ID（推荐：测试员提单入口，未挂执行的新单也在）")
+    p.add_argument("--execution", type=int, help="执行 ID（只含已挂执行的单）")
     p.add_argument("--project", type=int, help="项目(课题) ID，取整个项目的 Bug")
-    p.add_argument("--status", help="筛选: all/unclosed/closed/assignedtome/openedbyme/resolvedbyme/unconfirmed")
+    p.add_argument("--status", help="筛选: all/unclosed/active/confirmed/resolved/closed/assignedtome/openedbyme/resolvedbyme")
+    p.add_argument("--keyword", action="append", help="标题关键词（可多次给出，任一命中即保留）")
+    p.add_argument("--assigned", help="指派给某账号（me＝当前账号）")
     p.add_argument("--order", default="id_desc", help="排序，默认 id_desc")
-    p.add_argument("--limit", type=int, default=20, help="每页条数，默认 20")
+    p.add_argument("--limit", type=int, default=20, help="每页条数，默认 20（--all 时按 100 取）")
     p.add_argument("--page", type=int, default=1)
     p.add_argument("--all", action="store_true", help="自动翻页获取全部")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_bugs)
 
-    p = sub.add_parser("bug", help="Bug 详情")
+    p = sub.add_parser("bug", help="Bug 详情（步骤＋截图清单＋actions 全历史）")
     p.add_argument("id", type=int)
-    p.add_argument("--json", action="store_true")
+    p.add_argument("--json", action="store_true", help="原始 JSON")
     p.set_defaults(func=cmd_bug)
+
+    p = sub.add_parser("download", help="下载 Bug 步骤截图与附件")
+    p.add_argument("id", type=int)
+    p.add_argument("--dir", help="保存目录，默认 $TMPDIR/zentao17-files/<id>")
+    p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("changes", help="巡检预检：产品未关闭单与跟踪单相对上次快照的变化")
+    p.add_argument("--product", type=int, required=True)
+    p.add_argument("--state", required=True, help="快照文件路径（JSON）")
+    p.add_argument("--keyword", action="append", help="新出现单子的标题关键词标注（不过滤）")
+    p.add_argument("--track", help="追加跟踪的 Bug 编号（逗号分隔）")
+    p.add_argument("--untrack", help="取消跟踪的 Bug 编号（逗号分隔）")
+    p.add_argument("--set-tracked", dest="set_tracked", help="整体替换跟踪集合（逗号分隔，空串＝清空）")
+    p.add_argument("--own-prefix", dest="own_prefix",
+                   help="本方动作的备注前缀（如「【胡义凯·自动代理」）：actor 为本人且备注以此开头的动作不算变化")
+    p.add_argument("--update", action="store_true", help="比对后把当前状态写成新快照（处理完本轮后执行）")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_changes)
 
     p = sub.add_parser("resolve", help="解决 Bug")
     p.add_argument("id", type=int)
@@ -549,14 +1097,14 @@ def main():
     p.add_argument("-c", "--comment", help="备注")
     p.set_defaults(func=cmd_close)
 
-    p = sub.add_parser("activate", help="激活 Bug")
+    p = sub.add_parser("activate", help="激活 Bug（网页会话通道；默认指派给上次解决人）")
     p.add_argument("id", type=int)
     p.add_argument("-c", "--comment", help="备注")
     p.add_argument("--assign", help="激活后指派给")
-    p.add_argument("--build", help="影响版本")
+    p.add_argument("--build", help="影响版本，默认沿用表单原值")
     p.set_defaults(func=cmd_activate)
 
-    p = sub.add_parser("assign", help="转派 Bug（网页会话通道，凭证复用 login）")
+    p = sub.add_parser("assign", help="转派 Bug（网页会话通道，保留原状态）")
     p.add_argument("id", type=int)
     p.add_argument("--to", required=True, help="目标账号（工号，如 10267114）")
     p.add_argument("-c", "--comment", help="转派备注")
@@ -568,9 +1116,15 @@ def main():
     p.set_defaults(func=cmd_comment)
 
     args = parser.parse_args()
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # 输出接 head 等管道被提前关闭时安静退出
     if args.cmd != "login" and not hasattr(args, "insecure"):
         args.insecure = False
-    args.func(args)
+    try:
+        args.func(args)
+    except NetworkError as e:
+        die(f"无法连接禅道服务（读请求已自动重试 {GET_RETRIES} 次）: {e}\n请检查地址是否正确、网络是否可达")
+    except ApiError as e:
+        die(str(e))
 
 
 if __name__ == "__main__":
