@@ -9,6 +9,20 @@ description: 通过 zentao17 命令行工具查询和操作公司自部署禅道
 
 本技能只管「怎么读写禅道」。具体项目的处理流程（何时 resolve、推送顺序、流转给谁）由上层技能规定，例如 LSP 项目的 zentao-bug-handling／zentao-unattended；**上层技能已授权的写操作，按上层规定执行，不再逐条向用户复述确认**。
 
+**CLI 版本：2026-10-28**（`zentao17 --version` 应输出同一日期）。
+
+## 能力以 `--help` 为准（先查再断言）
+
+- **本技能的命令集会持续演进**。长会话里早先读过的版本可能已经过期：2026-10-28 曾有一个开了 18 天的会话，凭 10-20 读到的旧文档断言「CLI 不能转派」，误用 `resolve -r external` 销账，最后还要用户手动指出才纠正（禅道 48151）。
+- **每次被调用都核对版本**：执行 `zentao17 --version`，输出日期与上一行不同，或者对话里记得的命令表与 `zentao17 --help` 不一致时，先重新读本文件，以及同目录的 `LOCAL.md`。
+- **说「CLI 不支持某操作」之前，必须先执行 `zentao17 --help`**（必要时再执行 `zentao17 <子命令> --help`）。只有确认命令不存在，或已经实际执行并失败（退出码 1/3/4），才可以说做不到，并且附上命令输出。不得凭记忆、旧文档或 spec 历史记录断言做不到。spec `tasks.md` 里「CLI 无独立评论命令」这类记录只代表当时的情况。
+- **做不到时不改用别的写操作凑结果**。例如不能转派时，不得用 resolve（含 `-r external`）代替；应保持原状态，带上命令输出向用户说明。
+
+## 本地配置与路径
+
+- `LOCAL.md` 与本文件在同一目录。本机路径是 `~/.agents/skills/zentao17/LOCAL.md`，Claude Code 通过 `~/.claude/skills/zentao17/` 软链访问的是同一份。里面有禅道地址、Bug 拉取口径、课题映射和**常用角色账号**（本人／产品／后端）。转派前先在这里查对方账号，查不到再用 `zentao17 users --search <姓名>`，不要把整张用户表交给用户去挑。
+- shell 报 `command not found: zentao17` 时，说明 `~/.local/bin` 不在该工具的 PATH 里，不代表没装。改用 `~/.local/bin/zentao17 …` 或 `python3 ~/.agents/skills/zentao17/scripts/zentao17.py …`。
+
 ## 首次使用：安装 CLI 命令
 
 `zentao17` 命令即本技能目录下的 `scripts/zentao17.py`（自带 shebang，仅依赖 Python 标准库）。软链到 PATH 中任意目录即可：

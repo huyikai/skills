@@ -52,6 +52,9 @@ RESOLUTION_NAMES = {
     "external": "外部原因", "postponed": "延期处理", "willnotfix": "不予解决", "tostory": "转为需求",
 }
 
+# 与 SKILL.md 开头的「CLI 版本」一致；改了命令集就同时改两处
+VERSION = "2026-10-28"
+
 EXIT_NOT_APPLIED = 3
 EXIT_UNKNOWN = 4
 
@@ -1008,6 +1011,8 @@ def main():
     parser = argparse.ArgumentParser(prog="zentao17", description="禅道 17.x 命令行工具(v1 RESTful API)，拉取/解决/关闭 Bug",
                                      formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     parser.add_argument("--insecure", action="store_true", help="忽略 HTTPS 自签名证书校验")
+    parser.add_argument("--version", action="version", version=f"zentao17 {VERSION}",
+                        help="CLI 版本；与 SKILL.md 记载不一致时先重读 SKILL.md")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("login", help="配置服务地址与账号（凭证仅存本机）")
