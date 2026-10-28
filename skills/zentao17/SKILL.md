@@ -9,7 +9,7 @@ description: 通过 zentao17 命令行工具查询和操作公司自部署禅道
 
 本技能只管「怎么读写禅道」。具体项目的处理流程（何时 resolve、推送顺序、流转给谁）由上层技能规定，例如 LSP 项目的 zentao-bug-handling／zentao-unattended；**上层技能已授权的写操作，按上层规定执行，不再逐条向用户复述确认**。
 
-**CLI 版本：2026-10-28**（`zentao17 --version` 应输出同一日期）。
+**CLI 版本：2026-10-29**（`zentao17 --version` 应输出同一日期）。
 
 ## 能力以 `--help` 为准（先查再断言）
 

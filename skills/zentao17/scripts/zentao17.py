@@ -53,7 +53,7 @@ RESOLUTION_NAMES = {
 }
 
 # 与 SKILL.md 开头的「CLI 版本」一致；改了命令集就同时改两处
-VERSION = "2026-10-28"
+VERSION = "2026-10-29"
 
 EXIT_NOT_APPLIED = 3
 EXIT_UNKNOWN = 4
@@ -1121,7 +1121,8 @@ def main():
     p.set_defaults(func=cmd_comment)
 
     args = parser.parse_args()
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # 输出接 head 等管道被提前关闭时安静退出
+    if hasattr(signal, "SIGPIPE"):  # Windows Python 无 SIGPIPE，原样调用会 AttributeError 崩溃
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # 输出接 head 等管道被提前关闭时安静退出
     if args.cmd != "login" and not hasattr(args, "insecure"):
         args.insecure = False
     try:
