@@ -28,6 +28,7 @@ import argparse
 import getpass
 import html
 import http.client
+import io
 import json
 import os
 import re
@@ -37,6 +38,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -56,7 +58,7 @@ RESOLUTION_NAMES = {
 }
 
 # 与 SKILL.md 开头的「CLI 版本」一致；改了命令集就同时改两处
-VERSION = "2026-10-29.2"
+VERSION = "2026-10-29.3"
 
 EXIT_NOT_APPLIED = 3
 EXIT_UNKNOWN = 4
@@ -1087,6 +1089,21 @@ def deployed_version():
     return m.group(1) if m else "?"
 
 
+def upstream_tree(repo, dest):
+    """把源仓库已推送版本（上游跟踪分支）的 skills/zentao17 导出到 dest；返回导出目录，失败返回 None。"""
+    rc, ref, _ = git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    ref = ref if rc == 0 and ref else "origin/main"
+    r = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", ref, "skills/zentao17"], capture_output=True)
+    if r.returncode != 0:
+        return None, ref
+    with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tar:
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(dest, filter="data")
+        else:
+            tar.extractall(dest)
+    return Path(dest) / "skills" / "zentao17", ref
+
+
 def cmd_self_update(args):
     if not args.force and CHECK_STAMP.is_file() and time.time() - CHECK_STAMP.stat().st_mtime < UPDATE_INTERVAL:
         print(f"zentao17 {VERSION}：{UPDATE_INTERVAL // 3600} 小时内已检查过，跳过（--force 立即检查）")
@@ -1098,24 +1115,34 @@ def cmd_self_update(args):
                 "用 zentao17 self-update --repo <克隆路径> 指定一次，之后自动记住", 2)
         SOURCE_MARK.write_text(f"{repo}\n", encoding="utf-8")
         head_before = git(repo, "rev-parse", "HEAD")[1]
-        rc, out, err = git(repo, "pull", "--ff-only", "-q")
+        rc, out, err = git(repo, "fetch", "-q", "origin")
         if rc != 0:
-            print(f"注意: git pull 失败，按源仓库现有内容同步：{err or out}")
+            print(f"注意: git fetch 失败，按本机已知的远端版本同步：{err or out}")
+        git(repo, "pull", "--ff-only", "-q")  # 顺带让源仓库跟上远端；失败不影响部署
         src = repo / "skills" / "zentao17"
         if src.resolve() == SKILL_DIR:
             changed = git(repo, "rev-parse", "HEAD")[1] != head_before
-        elif git(repo, "status", "--porcelain", "--", "skills/zentao17")[1]:
-            print(f"注意: 源仓库 {src} 有未提交改动，跳过同步，部署副本保持不变")
-            changed = False
         else:
-            changed = mirror(src, SKILL_DIR, top=True)
+            # 只部署已推送到远端的内容：本机提交但未推送、或未提交的改动都不生效
+            with tempfile.TemporaryDirectory() as tmp:
+                tree, ref = upstream_tree(repo, tmp)
+                if tree is None or not (tree / "SKILL.md").is_file():
+                    die(f"无法从源仓库的 {ref} 导出 skills/zentao17", 2)
+                if not (SKILL_DIR / "LOCAL.md").exists() and (src / "LOCAL.md").is_file():
+                    shutil.copy2(src / "LOCAL.md", tree / "LOCAL.md")
+                changed = mirror(tree, SKILL_DIR, top=True)
+            unpushed = git(repo, "log", "--oneline", f"{ref}..HEAD", "--", "skills/zentao17")[1]
+            if unpushed or git(repo, "status", "--porcelain", "--", "skills/zentao17")[1]:
+                print(f"注意: 源仓库有未推送或未提交的 zentao17 改动，未部署（只部署已推送到 {ref} 的内容）")
     except FileNotFoundError:
         die("找不到 git 命令，无法自更新", 2)
     if rc == 0:
         CHECK_STAMP.write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"), encoding="utf-8")
     new_version = deployed_version()
-    if changed or new_version != VERSION:
+    if new_version != VERSION:
         print(f"zentao17 已更新：{VERSION} → {new_version}。请重新读取 SKILL.md 与 LOCAL.md 后再继续")
+    elif changed:
+        print(f"zentao17 内容已更新（版本 {VERSION}）。请重新读取 SKILL.md 与 LOCAL.md 后再继续")
     else:
         print(f"zentao17 {VERSION}：已是最新")
 
@@ -1233,7 +1260,7 @@ def main():
     p.add_argument("-c", "--comment", required=True, help="备注内容")
     p.set_defaults(func=cmd_comment)
 
-    p = sub.add_parser("self-update", help="从本机 skills 源仓库拉取最新版并同步到部署副本（6 小时节流）")
+    p = sub.add_parser("self-update", help="从 skills 源仓库同步已推送到远端的版本到部署副本（6 小时节流）")
     p.add_argument("--force", action="store_true", help="忽略节流，立即检查")
     p.add_argument("--repo", help="skills 源仓库路径（首次找不到时指定，之后自动记住）")
     p.set_defaults(func=cmd_self_update)
