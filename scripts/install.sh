@@ -81,14 +81,37 @@ pick_target() {
   echo "${detected[$((n - 1))]}"
 }
 
-# 把仓库中的 skill 复制到目标目录（整目录替换，保持自包含）
+# 用仓库版本整目录替换 <target>/<name>，保持自包含。
+# 目标是符号链接时跳过并返回 1：rm -rf 会把链接换成独立副本，链接指向的真身由其所在目录自行刷新。
+# 已部署的 LOCAL.md（不入库的本机私有配置）原样保留，仓库里的同名文件不覆盖它。
+refresh_one() {
+  local name="$1" dest="$2/$1" keep=""
+  if [ -L "$dest" ]; then
+    echo "跳过（符号链接）: $dest -> $(readlink "$dest")"
+    return 1
+  fi
+  if [ -f "$dest/LOCAL.md" ]; then
+    keep="$(mktemp)"
+    cp -p "$dest/LOCAL.md" "$keep"
+  fi
+  rm -rf "$dest"
+  cp -R "$SKILLS_DIR/$name" "$dest"
+  if [ -n "$keep" ]; then
+    if [ -f "$dest/LOCAL.md" ] && ! cmp -s "$keep" "$dest/LOCAL.md"; then
+      echo "注意: 仓库中的 $name/LOCAL.md 与已部署版本不同，已保留已部署版本"
+    fi
+    mv "$keep" "$dest/LOCAL.md"
+  fi
+}
+
+# 把仓库中的 skill 复制到目标目录
 install_one() {
   local name="$1" target="$2"
   [ -f "$SKILLS_DIR/$name/SKILL.md" ] || die "仓库中不存在 skill: $name"
   mkdir -p "$target"
-  rm -rf "$target/$name"
-  cp -R "$SKILLS_DIR/$name" "$target/$name"
-  echo "已安装: $name -> $target/$name"
+  if refresh_one "$name" "$target"; then
+    echo "已安装: $name -> $target/$name"
+  fi
 }
 
 cmd_list() {
@@ -113,7 +136,9 @@ cmd_list() {
     echo "  $d"
     if [ "${#skills[@]}" -gt 0 ]; then
       for s in "${skills[@]}"; do
-        if [ -f "$d/$s/SKILL.md" ]; then
+        if [ -L "$d/$s" ]; then
+          echo "    [链接]   $s -> $(readlink "$d/$s")"
+        elif [ -f "$d/$s/SKILL.md" ]; then
           echo "    [已安装] $s"
         fi
       done
@@ -152,9 +177,7 @@ cmd_update() {
   [ "${#targets[@]}" -gt 0 ] || { echo "本机无 skill 目录，无需刷新。"; return; }
   while IFS= read -r s; do
     for d in "${targets[@]}"; do
-      if [ -f "$d/$s/SKILL.md" ]; then
-        rm -rf "$d/$s"
-        cp -R "$SKILLS_DIR/$s" "$d/$s"
+      if [ -f "$d/$s/SKILL.md" ] && refresh_one "$s" "$d"; then
         echo "已刷新: $s @ $d"
         refreshed=$((refreshed + 1))
       fi
