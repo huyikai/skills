@@ -16,6 +16,7 @@
   zentao17 assign 123 --to 10267114 -c "转产品拍板"   # 转派（网页会话通道，保留原状态）
   zentao17 comment 123 -c "进展更新..."               # 独立备注（网页会话通道）
   zentao17 users --search 孙杰                        # 查账号
+  zentao17 self-update                                # 从本机 skills 源仓库拉取最新版（6 小时节流）
 
 写命令（resolve/close/activate/assign/comment）一律写后回读 actions 自验证，退出码:
   0 已生效（或目标状态已满足、未重复执行）  1 一般错误/服务端拒绝
@@ -30,9 +31,11 @@ import http.client
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
@@ -53,7 +56,7 @@ RESOLUTION_NAMES = {
 }
 
 # 与 SKILL.md 开头的「CLI 版本」一致；改了命令集就同时改两处
-VERSION = "2026-10-29"
+VERSION = "2026-10-29.2"
 
 EXIT_NOT_APPLIED = 3
 EXIT_UNKNOWN = 4
@@ -1007,6 +1010,116 @@ def cmd_comment(args):
     run_write(args, "备注", write, check)
 
 
+# ---------- 自更新：从本机 skills 源仓库（git 克隆）拉取最新版，同步到部署副本 ----------
+SKILL_DIR = Path(__file__).resolve().parent.parent
+SOURCE_MARK = SKILL_DIR / ".source-repo"   # 源仓库位置，首次找到后记住
+CHECK_STAMP = SKILL_DIR / ".update-check"  # 上次成功检查的时间，用于节流
+UPDATE_INTERVAL = 6 * 3600
+KEEP_FILES = {"LOCAL.md", ".source-repo", ".update-check"}  # 本机私有，同步时不删不改
+IGNORED = {"__pycache__", ".DS_Store"}
+SCAN_PRUNE = {"node_modules", "Library", "AppData", "Applications", "Pictures", "Music", "Movies", "venv"}
+
+
+def git(repo, *args):
+    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def is_source_repo(path):
+    path = Path(path)
+    return (path / "skills" / "zentao17" / "scripts" / "zentao17.py").is_file() and (path / ".git").exists()
+
+
+def find_source_repo(explicit=None):
+    if explicit:
+        path = Path(explicit).expanduser()
+        return path.resolve() if is_source_repo(path) else None
+    candidates = []
+    if os.environ.get("ZENTAO17_SKILLS_REPO"):
+        candidates.append(Path(os.environ["ZENTAO17_SKILLS_REPO"]).expanduser())
+    if SOURCE_MARK.is_file():
+        candidates.append(Path(SOURCE_MARK.read_text(encoding="utf-8").strip()))
+    candidates.append(SKILL_DIR.parent.parent)  # 部署副本本身就是源仓库里的 skills/zentao17
+    for path in candidates:
+        if is_source_repo(path):
+            return path.resolve()
+    # 兜底：在用户主目录下浅层扫描（跳过隐藏目录与大目录，限时 5 秒）
+    home, deadline = Path.home(), time.time() + 5
+    for root, dirs, _ in os.walk(home):
+        if time.time() > deadline:
+            break
+        if is_source_repo(root):
+            return Path(root).resolve()
+        depth = len(Path(root).relative_to(home).parts)
+        dirs[:] = [] if depth >= 4 else [d for d in dirs if not d.startswith(".") and d not in SCAN_PRUNE]
+    return None
+
+
+def mirror(src, dst, top=False):
+    """让 dst 与 src 内容一致（KEEP_FILES 只在顶层保护，LOCAL.md 仅在 dst 缺失时带入）；返回是否有改动。"""
+    changed = False
+    dst.mkdir(exist_ok=True)
+    src_names = {n for n in os.listdir(src) if n not in IGNORED}
+    for name in os.listdir(dst):
+        if name in src_names or name in IGNORED or (top and name in KEEP_FILES):
+            continue
+        target = dst / name
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        changed = True
+    for name in sorted(src_names):
+        s, d = src / name, dst / name
+        if top and name in KEEP_FILES and d.exists():
+            continue
+        if s.is_dir():
+            changed = mirror(s, d) or changed
+        elif not d.is_file() or s.read_bytes() != d.read_bytes():
+            shutil.copy2(s, d)
+            changed = True
+    return changed
+
+
+def deployed_version():
+    m = re.search(r'^VERSION = "([^"]+)"', (SKILL_DIR / "scripts" / "zentao17.py").read_text(encoding="utf-8"), re.M)
+    return m.group(1) if m else "?"
+
+
+def cmd_self_update(args):
+    if not args.force and CHECK_STAMP.is_file() and time.time() - CHECK_STAMP.stat().st_mtime < UPDATE_INTERVAL:
+        print(f"zentao17 {VERSION}：{UPDATE_INTERVAL // 3600} 小时内已检查过，跳过（--force 立即检查）")
+        return
+    try:
+        repo = find_source_repo(args.repo)
+        if repo is None:
+            die("找不到 skills 源仓库（含 skills/zentao17 的 git 克隆）。"
+                "用 zentao17 self-update --repo <克隆路径> 指定一次，之后自动记住", 2)
+        SOURCE_MARK.write_text(f"{repo}\n", encoding="utf-8")
+        head_before = git(repo, "rev-parse", "HEAD")[1]
+        rc, out, err = git(repo, "pull", "--ff-only", "-q")
+        if rc != 0:
+            print(f"注意: git pull 失败，按源仓库现有内容同步：{err or out}")
+        src = repo / "skills" / "zentao17"
+        if src.resolve() == SKILL_DIR:
+            changed = git(repo, "rev-parse", "HEAD")[1] != head_before
+        elif git(repo, "status", "--porcelain", "--", "skills/zentao17")[1]:
+            print(f"注意: 源仓库 {src} 有未提交改动，跳过同步，部署副本保持不变")
+            changed = False
+        else:
+            changed = mirror(src, SKILL_DIR, top=True)
+    except FileNotFoundError:
+        die("找不到 git 命令，无法自更新", 2)
+    if rc == 0:
+        CHECK_STAMP.write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"), encoding="utf-8")
+    new_version = deployed_version()
+    if changed or new_version != VERSION:
+        print(f"zentao17 已更新：{VERSION} → {new_version}。请重新读取 SKILL.md 与 LOCAL.md 后再继续")
+    else:
+        print(f"zentao17 {VERSION}：已是最新")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="zentao17", description="禅道 17.x 命令行工具(v1 RESTful API)，拉取/解决/关闭 Bug",
                                      formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
@@ -1119,6 +1232,11 @@ def main():
     p.add_argument("id", type=int)
     p.add_argument("-c", "--comment", required=True, help="备注内容")
     p.set_defaults(func=cmd_comment)
+
+    p = sub.add_parser("self-update", help="从本机 skills 源仓库拉取最新版并同步到部署副本（6 小时节流）")
+    p.add_argument("--force", action="store_true", help="忽略节流，立即检查")
+    p.add_argument("--repo", help="skills 源仓库路径（首次找不到时指定，之后自动记住）")
+    p.set_defaults(func=cmd_self_update)
 
     args = parser.parse_args()
     if hasattr(signal, "SIGPIPE"):  # Windows Python 无 SIGPIPE，原样调用会 AttributeError 崩溃
