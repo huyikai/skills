@@ -5,23 +5,23 @@ description: 通过 zentao17 命令行工具查询和操作公司自部署禅道
 
 # 禅道 17.8 CLI（zentao17）
 
-公司禅道自部署于固定 IP，版本 **17.8**。官方 `zentao-cli` 需要 API 2.0（禅道 22+），在本环境不可用（会误报"用户名和密码不正确"）。本技能使用 `zentao17` 命令，基于 v1 RESTful API（禅道 12.0+ 均支持）；v1 不开放的激活、转派、独立备注走网页会话通道。
+公司禅道自部署于固定 IP，版本 **17.8**。官方 `zentao-cli` 需要 API 2.0（禅道 22+），在本环境不可用（会误报「用户名和密码不正确」）。本技能使用 `zentao17` 命令，基于 v1 RESTful API（禅道 12.0+ 均支持）；v1 不开放的激活、转派、独立备注走网页会话通道。
 
 本技能只管「怎么读写禅道」。具体项目的处理流程（何时 resolve、推送顺序、流转给谁）由上层技能规定，例如 LSP 项目的 zentao-bug-handling／zentao-unattended；**上层技能已授权的写操作，按上层规定执行，不再逐条向用户复述确认**。
 
-**CLI 版本：2026-10-29.2**（`zentao17 --version` 应输出同一日期）。
+**CLI 版本：2026-10-29.2**（`zentao17 --version` 应输出同一值）。
 
-## 能力以 `--help` 为准（先查再断言）
+## 开工自检（每次调用都执行）
 
-- **本技能的命令集会持续演进**。长会话里早先读过的版本可能已经过期：2026-10-28 曾有一个开了 18 天的会话，凭 10-20 读到的旧文档断言「CLI 不能转派」，误用 `resolve -r external` 销账，最后还要用户手动指出才纠正（禅道 48151）。
-- **每次被调用先自更新，再核对版本**：先执行 `zentao17 self-update`，它从本机 skills 源仓库 `git pull` 后同步到本技能目录，6 小时内只真正检查一次，其余调用秒回「跳过」。输出「已更新」，或者 `zentao17 --version` 与上一行不同，或者对话里记得的命令表与 `zentao17 --help` 不一致时，先重新读本文件，以及同目录的 `LOCAL.md`。
-- **自更新失败不阻塞**：报「找不到 skills 源仓库」时，在用户主目录下找含 `skills/zentao17/scripts/zentao17.py` 的 git 克隆，执行 `zentao17 self-update --repo <克隆路径>` 记住一次；找不到或 git 失败时，按当前版本继续工作，在回复里提一句。不要为此去改源仓库或执行 `git reset` 之类的命令。
-- **说「CLI 不支持某操作」之前，必须先执行 `zentao17 --help`**（必要时再执行 `zentao17 <子命令> --help`）。只有确认命令不存在，或已经实际执行并失败（退出码 1/3/4），才可以说做不到，并且附上命令输出。不得凭记忆、旧文档或 spec 历史记录断言做不到。spec `tasks.md` 里「CLI 无独立评论命令」这类记录只代表当时的情况。
-- **做不到时不改用别的写操作凑结果**。例如不能转派时，不得用 resolve（含 `-r external`）代替；应保持原状态，带上命令输出向用户说明。
+1. **先自更新**：执行 `zentao17 self-update`。它从本机 skills 源仓库 `git pull` 后同步到本技能目录，6 小时内只真正检查一次，其余调用直接返回「跳过」。
+2. **再核对版本**：`self-update` 输出「已更新」，或 `zentao17 --version` 与上面的 CLI 版本不同，或对话里记得的命令表与 `zentao17 --help` 不一致时，重新读本文件与同目录的 `LOCAL.md`，以新读到的为准。长会话里早先读过的内容可能已经过期。
+3. **自更新失败不阻塞**：报「找不到 skills 源仓库」时，在用户主目录下找含 `skills/zentao17/scripts/zentao17.py` 的 git 克隆，执行 `zentao17 self-update --repo <克隆路径>` 记住一次；找不到或 git 失败时按当前版本继续，在回复里提一句。不要为此改源仓库或执行 `git reset` 之类的命令。
+4. **能力以 `--help` 为准**：说「CLI 不支持某操作」之前，先执行 `zentao17 --help`（必要时 `zentao17 <子命令> --help`）。只有确认命令不存在，或实际执行后失败（退出码 1/3/4），才可以说做不到，并附上命令输出。记忆、旧文档和 spec 里的历史记录都不能作为「做不到」的依据。
+5. **做不到时不用别的写操作凑结果**：例如不能转派时，不得用 resolve（含 `-r external`）代替；保持原状态，带上命令输出向用户说明。
 
 ## 本地配置与路径
 
-- `LOCAL.md` 与本文件在同一目录。本机路径是 `~/.agents/skills/zentao17/LOCAL.md`，Claude Code 通过 `~/.claude/skills/zentao17/` 软链访问的是同一份。里面有禅道地址、Bug 拉取口径、课题映射和**常用角色账号**（本人／产品／后端）。转派前先在这里查对方账号，查不到再用 `zentao17 users --search <姓名>`，不要把整张用户表交给用户去挑。
+- `LOCAL.md` 与本文件在同一目录（本机为 `~/.agents/skills/zentao17/LOCAL.md`，各工具的 skills 目录下是指向它的链接）。里面有禅道地址、Bug 拉取口径、课题映射和**常用角色账号**（本人／产品／后端）。转派前先在这里查对方账号，查不到再用 `zentao17 users --search <姓名>`，不要把整张用户表交给用户去挑。
 - shell 报 `command not found: zentao17` 时，说明 `~/.local/bin` 不在该工具的 PATH 里，不代表没装。改用 `~/.local/bin/zentao17 …` 或 `python3 ~/.agents/skills/zentao17/scripts/zentao17.py …`。
 
 ## 首次使用：安装 CLI 命令
@@ -33,9 +33,9 @@ ln -sf /path/to/skills/zentao17/scripts/zentao17.py ~/.local/bin/zentao17
 zentao17 --help
 ```
 
-安装后 CLI 会自更新（见上文 `self-update`）：源仓库位置首次找到后记在本目录的 `.source-repo`，同步时保留 `LOCAL.md`；源仓库里 `skills/zentao17` 有未提交改动时跳过同步，以免把开发中的半成品部署出去。
+之后创建本地私有配置：`cp LOCAL.example.md LOCAL.md`，填写禅道地址、Bug 拉取口径与课题号映射（该文件已 gitignore，不入库）。最后按「凭证安全」一节在终端执行 `zentao17 login`。
 
-安装后创建本地私有配置：`cp LOCAL.example.md LOCAL.md`，填写禅道地址、Bug 拉取口径与课题号映射（该文件已 gitignore，不入库）。最后按「凭证安全」一节在终端执行 `zentao17 login` 完成配置。
+自更新的细节：源仓库位置首次找到后记在本目录的 `.source-repo`；同步时保留 `LOCAL.md`；源仓库里 `skills/zentao17` 有未提交改动时跳过同步，避免把开发中的半成品部署出去。
 
 ## 凭证安全
 
@@ -63,6 +63,7 @@ zentao17 --help
 | 激活 Bug | `zentao17 activate <id> [-c "备注"] [--assign 账号]`（网页会话通道；默认指派给上次解决人） |
 | 转派 Bug | `zentao17 assign <id> --to <账号> [-c "备注"]`（网页会话通道，保留原状态） |
 | 添加备注 | `zentao17 comment <id> -c "备注"`（网页会话通道，不改状态） |
+| 自更新 | `zentao17 self-update [--force] [--repo <源仓库路径>]` |
 
 常用选项：`--limit 50 --page 1` 分页；`--all` 取全部页；`--order id_desc` 排序；`--json` 输出原始 JSON 供程序处理；`--insecure` 忽略自签名证书（全局参数，放在子命令前）。
 
@@ -79,7 +80,7 @@ resolve／close／activate／assign／comment 都会**先读、再写、再回�
 
 读请求遇到超时、连接重置会自动重试 3 次；写请求不自动重试，以回读为准。超时不等于失败。
 
-## 意图识别与解析规则（重要）
+## 意图识别与解析规则
 
 **禅道网页链接解析**（Path-Info 格式 `http://<禅道主机>/<模块>-<方法>-<ID>.html`，主机地址见本目录 `LOCAL.md`）：
 - `bug-view-<BugID>.html` → `zentao17 bug <BugID>`
@@ -91,7 +92,7 @@ resolve／close／activate／assign／comment 都会**先读、再写、再回�
 
 用户给出**新课题号**时：先 `zentao17 projects --search <课题号> --all` 查编号；查不到则用项目名搜或询问用户对应哪个禅道项目，确认后把映射补进 `LOCAL.md` 的映射表。
 
-**拉取口径**（2026-10-26／10-28 实测）：
+**拉取口径**：
 - **产品级是权威来源**：测试员从产品入口提单，新单常常不挂执行。执行级查询只能看到已挂执行的子集，会漏单。批量处理一律用 `bugs --product <id>`，执行级仅作补充。
 - 项目级接口（`/projects/{id}/bugs`）对普通账号返回 403。
 - **状态筛选在客户端执行**：执行级接口忽略 `status` 参数（`unclosed` 也会返回已关闭单），产品级默认只返回未关闭单；脚本对 `--status`／`--keyword`／`--assigned` 一律取全部页后在本地过滤，输出首行会注明。
@@ -108,28 +109,29 @@ resolve／close／activate／assign／comment 都会**先读、再写、再回�
 
 ## 网页会话通道（activate / assign / comment）
 
-v1 API 在禅道 17.8 上不开放激活、独立备注与转派（activate 路由 404；`PUT /bugs/{id}` 忽略 assignedTo/comment），这三个命令走网页路由：`bug-activate-{id}.html`、`bug-assignTo-{id}.html` 与 `action-comment-bug-{id}.html`。脚本用 `login` 已存凭证自动换 zentaosid 会话（缓存于 `~/.config/zentao17/web-session.json`，权限 600，失效自动重登）。实测要点（已写死在脚本里）：
+v1 API 在禅道 17.8 上不开放激活、独立备注与转派（activate 路由 404；`PUT /bugs/{id}` 忽略 assignedTo/comment），这三个命令走网页路由：`bug-activate-{id}.html`、`bug-assignTo-{id}.html` 与 `action-comment-bug-{id}.html`。脚本用 `login` 已存凭证自动换 zentaosid 会话（缓存于 `~/.config/zentao17/web-session.json`，权限 600，失效自动重登）。脚本已处理的要点：
 - 登录 POST 必须带 `X-Requested-With: XMLHttpRequest` 才返回 success JSON；登录后的页面请求必须带 `Referer`，否则会被渲染成访客首页（假登录）。
-- 转派表单有隐藏字段 `status`，值为单子的**当前状态**，脚本原样回传。旧版脚本把它写死为 `active`，转派已解决的单时会悄悄把单子改回激活。
+- 转派表单的隐藏字段 `status` 是单子的**当前状态**，脚本原样回传，转派不会改变状态。早期脚本把它写死为 `active`，历史记录里「转派后状态变 active」的情况可能出于这个原因。
 - 激活表单默认指派给上次解决人，影响版本沿用原值；`--assign` 可改指派人。
 - 附件 `file-read-*.png` 无需登录即可下载。
 
 ## 使用策略
 
 1. **不知道产品 ID 时**先执行 `zentao17 products`。
-2. **读 Bug 必须读全**：用 `zentao17 bug <id>` 一次拿到步骤、截图清单、actions 全历史；截图是测试员标注的证据，定性前用 `download` 拉下来核对。激活（activated）记录和评论常是诉求的追加层，漏读会错认问题对象。只读 steps、不读 actions，等于没读全。`--json` 只在需要程序处理原始字段时使用。
-3. **写操作**：没有上层技能授权时，resolve／close／activate／assign／comment 执行前向用户复述操作对象与备注内容；有上层技能授权时按上层规定执行。写命令的结果以退出码与回读为准（见上表）。
-4. **推荐闭环**：拉取 `--status assignedtome` 的 Bug → 修复并上线 → `resolve <id> -c "已在 commit xxx 修复，请验证"`（解决后禅道会自动指回创建者验证）。代码上线前不要 resolve，否则测试员会去验证一个还没部署的修复；各项目的推送与同步步骤以项目规则为准。
-5. 表格输出中「指派给/创建人」显示姓名；列表状态 `激活(已确认)` 对应接口的 `confirmed`。
-6. 若报「无法连接」，检查地址格式（应形如 `http://IP:端口/zentao`）或网络；报 403 是账号权限不足；报「登录失败」重新执行 `zentao17 login`。
+2. **读 Bug 必须读全**：用 `zentao17 bug <id>` 一次拿到步骤、截图清单、actions 全历史；截图是测试员标注的证据，定性前用 `download` 拉下来核对。激活（activated）记录和评论常是诉求的追加层，漏读会错认问题对象。只读 steps、不读 actions，等于没读全。
+3. **筛选与统计用 CLI 参数**：按状态、指派人、关键词筛选或计数时，用 `--status`／`--assigned`／`--keyword`，由脚本统一处理接口差异（见「状态口径」）。只有 CLI 参数表达不了的需求才自己处理 `--json` 的原始字段，并按「状态口径」兼容各种形态。
+4. **写操作**：没有上层技能授权时，resolve／close／activate／assign／comment 执行前向用户复述操作对象与备注内容；有上层技能授权时按上层规定执行。写命令的结果以退出码与回读为准（见上表）。
+5. **推荐闭环**：拉取 `--status assignedtome` 的 Bug → 修复并上线 → `resolve <id> -c "已在 commit xxx 修复，请验证"`（解决后禅道会自动指回创建者验证）。代码上线前不要 resolve，否则测试员会去验证一个还没部署的修复；各项目的推送与同步步骤以项目规则为准。
+6. 表格输出中「指派给/创建人」显示姓名；列表状态 `激活(已确认)` 对应接口的 `confirmed`。
+7. 若报「无法连接」，检查地址格式（应形如 `http://IP:端口/zentao`）或网络；报 403 是账号权限不足；报「登录失败」重新执行 `zentao17 login`。
 
 ## 状态口径（批量统计/分析必读）
 
-- 状态链：active（激活）→ resolved（已解决待验证）→ closed（已关闭）。**activated = 修复后复测不通过被打回**——有 activated 历史的单子是"争议中"，不是"已解决"。
-- **列表与详情的 status 取值不同**：列表接口对「激活且已确认」的单返回 `confirmed`，详情接口返回 `active`＋`confirmed: 1`（#48217 实证）。**`confirmed` 池里藏着大量详情为 `active` 的单**（#48664/#48518/#48594 等 7 条 S2 实证：报 6 条实为 13 条）。**统计"激活"的正确公式**：取全部未关闭的 S2（列表 status ∈ {active, confirmed, resolved}），逐条 `bug <id>` 复核详情状态——详情 `active` 才是真激活。只按列表 `status=='active'` 过滤会漏掉整个 confirmed 池。
-- **同一字段在列表与详情接口的结构不同（assignedTo 实证）**：列表接口的 `assignedTo` 是**纯字符串**（账号 ID，如 `"10207449"`），详情接口是**对象**（`{account, realname, ...}`）。按指派人过滤/统计时**必须同时兼容两种形态**——只匹配 dict 会把列表数据全部漏掉（#48705 实证：实际 57 条指派前端，误报 0 条）。判断"指派给谁"的显示名一律走详情接口。
-- **批量统计前必须现场重拉数据**：缓存的 bugs 列表 JSON（如 /tmp 下的落盘）可能落后于最新开单/流转（#48705 实证：分析时新单已开出但结论基于旧快照）。统计"当前情况"一律重新执行 `bugs --execution ... --json`，不得复用上一次命令的落盘。
-- **反复 resolved→activated 的单**（如 #48217 两轮修复两轮打回）通常意味着根因未定位或存在诊断盲区——按"活问题"处理：看最后一条 activated 的评论/截图与最新指派，不要按已解决叙事；再次 resolve 前必须先解释"上轮为什么没修好"。
+- 状态链：active（激活）→ resolved（已解决待验证）→ closed（已关闭）。**activated＝修复后复测不通过被打回**；有 activated 历史的单子是「争议中」，不是「已解决」。
+- **列表与详情的 status 取值不同**：列表接口对「激活且已确认」的单返回 `confirmed`，详情接口返回 `active`＋`confirmed: 1`。所以「激活」在列表里对应 `active` 与 `confirmed` 两种值；`--status active` 已包含两者。自己处理 `--json` 时只按 `status == 'active'` 过滤，会漏掉整个 confirmed 池。判断单条的当前状态以 `zentao17 bug <id>` 为准；需要精确统计激活单（如按严重级汇报）时，取全部未关闭单逐条查详情，详情为 `active` 才算激活。
+- **同一字段在列表与详情里结构不同**：列表接口的 `assignedTo` 是纯字符串（账号，如 `"10207449"`），详情接口是对象（`{account, realname, ...}`）。自己处理 `--json` 时必须兼容两种形态；`--assigned` 已兼容。显示名一律走详情接口。
+- **统计「当前情况」必须现场重拉**：之前落盘的列表 JSON 可能已落后于新开单和流转，不得复用。
+- **反复 resolved→activated 的单**通常意味着根因未定位或存在诊断盲区：按「活问题」处理，看最后一条 activated 的评论、截图与最新指派，不要按已解决叙事；再次 resolve 前必须先说明上一轮为什么没修好。
 
 ## 错误对照
 
@@ -141,3 +143,4 @@ v1 API 在禅道 17.8 上不开放激活、独立备注与转派（activate 路�
 | HTTP 404 | 服务端无此接口，确认禅道版本 |
 | 无法连接（已自动重试 3 次） | 地址或网络问题，HTTPS 自签名证书加 `--insecure` |
 | 写命令退出码 3/4 | 见「写命令的回读与退出码」 |
+| `self-update` 报找不到源仓库 | 见「开工自检」第 3 条 |
