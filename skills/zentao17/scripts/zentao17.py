@@ -15,12 +15,16 @@
   zentao17 activate 123 -c "误解决，重新激活"         # 激活（网页会话通道）
   zentao17 assign 123 --to 10267114 -c "转产品拍板"   # 转派（网页会话通道，保留原状态）
   zentao17 comment 123 -c "进展更新..."               # 独立备注（网页会话通道）
+  zentao17 comment 123 -F note.md                     # 备注从 UTF-8 文件读（中日文推荐，所有写命令都支持）
+  zentao17 doctor --probe "禅道検証・中文テスト①（全角）✅"  # 环境自检：中日文传入通道是否保真
   zentao17 users --search 孙杰                        # 查账号
   zentao17 self-update                                # 从本机 skills 源仓库拉取最新版（6 小时节流）
 
 写命令（resolve/close/activate/assign/comment）一律写后回读 actions 自验证，退出码:
   0 已生效（或目标状态已满足、未重复执行）  1 一般错误/服务端拒绝
   3 回读确认未生效（可核对后重试）          4 结果未知（网络中断且回读失败，切勿直接重试）
+  5 备注疑似编码损坏，已拦截未写入          6 已写入，但禅道保存的备注与发送内容不一致
+  7 备注未通过上层技能的模板校验，已拦截未写入
 
 凭证来源优先级: 命令行参数 > 环境变量(ZENTAO_URL/ZENTAO_ACCOUNT/ZENTAO_PASSWORD) > ~/.config/zentao17/credentials.json
 """
@@ -58,10 +62,14 @@ RESOLUTION_NAMES = {
 }
 
 # 与 SKILL.md 开头的「CLI 版本」一致；改了命令集就同时改两处
-VERSION = "2026-10-29.3"
+VERSION = "2026-11-05.1"
 
 EXIT_NOT_APPLIED = 3
 EXIT_UNKNOWN = 4
+EXIT_SUSPICIOUS = 5  # 备注疑似编码损坏，已拦截、未写入
+EXIT_MISMATCH = 6    # 已写入，但禅道保存的备注与发送内容不一致
+EXIT_LINT = 7        # 备注未通过上层技能的模板校验，已拦截、未写入
+WRITE_COMMANDS = ("resolve", "close", "activate", "assign", "comment")
 
 # 读请求遇到这些错误自动重试；写请求不重试，交给写后回读判定。
 NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, socket.timeout, ConnectionError, http.client.HTTPException)
@@ -240,6 +248,180 @@ def strip_html(text, images=None):
 def norm_text(text):
     """比对用：去标签、反转义、折叠空白。"""
     return re.sub(r"\s+", " ", strip_html(text or "")).strip()
+
+
+# ---------------------------------------------------------------------------
+# 备注文本完整性。编码问题常在文本到达本工具之前就发生（Windows PowerShell 5.1 管道按
+# ASCII 编码、ANSI 代码页写文件等），中日文被整段换成「?」后再写入，回读时乱码与发送内容
+# 一致、无从察觉（2026-10-31 #48775）。所以写入前先拦截可疑文本，写入后再全文比对。
+PROBE_SAMPLE = "禅道検証・中文テスト①（全角）✅"
+_MOJIBAKE_RE = re.compile(  # UTF-8 字节被按 Latin-1/CP1252 解码后的典型序列，如「ã€」「æ–‡」
+    "(?:[Â-ï][\u0080-¿ŒœŠšŸŽžƒˆ˜"
+    "–—‘-„†-•…‰‹›€™]{1,2}){2,}")
+
+
+def text_problems(text):
+    """返回编码损坏迹象列表；空列表表示未见异常。"""
+    probs = []
+    if "�" in text:
+        probs.append("含替换字符 U+FFFD（解码失败）")
+    if re.search("[\ud800-\udfff]", text):
+        probs.append("含未解码的原始字节（surrogate）")
+    if "锟斤拷" in text:
+        probs.append("含「锟斤拷」（UTF-8 被按 GBK 反复转换）")
+    runs = re.findall(r"\?{3,}", text)
+    if runs:
+        probs.append(f"含 {len(runs)} 处连续问号（中日文在传入前被替换成 ?）")
+    cjk = "぀-ヿ㐀-鿿＀-￯"
+    lone = re.findall(f"[{cjk}]\\?{{1,2}}[{cjk}]", text)
+    if lone and not runs:  # 日文 Windows 的 cp932 缺简体字时只零星替换，如「稼?計画」
+        probs.append(f"含 {len(lone)} 处夹在中日文之间的半角问号（个别字在传入前被替换成 ?；正文问号请用全角「？」）")
+    if _MOJIBAKE_RE.search(text):
+        probs.append("含「ã€／æ–」类序列（UTF-8 被按 Latin-1/CP1252 解码）")
+    return probs
+
+
+def decode_text(raw, source):
+    """字节 → 文本：认 UTF-8（可带 BOM）与带 BOM 的 UTF-16（PowerShell 5.1 Out-File 默认）。"""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        die(f"{source} 不是 UTF-8 编码（第 {e.start} 字节起无法解码），已拦截未写入。"
+            "请用 UTF-8 重新保存后再试；先执行 zentao17 doctor 检查环境。", EXIT_SUSPICIOUS)
+
+
+def resolve_comment(args, required=False):
+    """统一备注来源（-c 文本／-c - 读标准输入／-F 文件），写入前做完整性拦截，结果写回 args.comment。"""
+    path = getattr(args, "comment_file", None)
+    text = getattr(args, "comment", None)
+    if path and text is not None:
+        die("-c 与 -F 只能用一个")
+    if path:
+        try:
+            raw = Path(path).expanduser().read_bytes()
+        except OSError as e:
+            die(f"读取备注文件失败: {e}")
+        text = decode_text(raw, f"备注文件 {path}")
+    elif text == "-":
+        text = decode_text(sys.stdin.buffer.read(), "标准输入")
+    if text is not None:
+        text = text.strip()
+    if required and not text:
+        die("备注内容不能为空")
+    if text:
+        probs = text_problems(text)
+        if probs and not getattr(args, "allow_suspicious", False):
+            die("备注疑似已被编码破坏，已拦截、未写入禅道：" + "；".join(probs)
+                + f"\n  片段: {text[:80]!r}"
+                + "\n  处理：用文件工具把备注写成 UTF-8 文件，改用 -F <文件>；并执行 zentao17 doctor 检查环境。"
+                + "\n  确认内容本来就是这样时，加 --allow-suspicious 放行。", EXIT_SUSPICIOUS)
+    args.comment = text
+
+
+COMMENT_LINT_NAME = "zentao17_comment_lint.py"
+
+
+def find_comment_lint():
+    """上层技能提供的备注模板校验脚本：环境变量 ZENTAO17_COMMENT_LINT 优先，
+    否则从当前目录向上找 .agents/skills/*/scripts/zentao17_comment_lint.py；找不到则不校验。"""
+    env = os.environ.get("ZENTAO17_COMMENT_LINT")
+    if env:
+        return Path(env).expanduser()
+    here = Path.cwd().resolve()
+    for d in (here, *here.parents):
+        hits = sorted(d.glob(f".agents/skills/*/scripts/{COMMENT_LINT_NAME}"))
+        if hits:
+            return hits[0]
+        if d == Path.home():
+            break
+    return None
+
+
+def role_of(account, me_account=""):
+    """按 LOCAL.md「常用角色账号」表判定角色：product／backend／self，表里没有的按 tester。"""
+    account = str(account or "")
+    if account and account == me_account:
+        return "self"
+    try:
+        text = (Path(__file__).resolve().parent.parent / "LOCAL.md").read_text(encoding="utf-8")
+    except OSError:
+        return "tester"
+    for row in re.findall(r"^\|([^|\n]+)\|([^|\n]+)\|\s*(\d+)\s*\|", text, re.M):
+        if row[2] == account:
+            name = row[0].strip()
+            if "本人" in name:
+                return "self"
+            if "后端" in name:
+                return "backend"
+            if "产品" in name or "设计" in name:
+                return "product"
+    return "tester"
+
+
+def reader_account(args, before):
+    """本条备注的读者账号：resolve/close 写给开单人，转派写给目标，激活写给被指派人，独立备注写给当前指派人。"""
+    if args.cmd in ("resolve", "close"):
+        return account_of(before.get("openedBy"))
+    if args.cmd == "assign":
+        return str(args.to)
+    if args.cmd == "activate":  # 不带 --assign 时禅道默认指派给上次解决人
+        return str(args.assign) if args.assign else account_of(before.get("resolvedBy"))
+    return account_of(before.get("assignedTo"))
+
+
+LINT_VIOLATION = 10  # 校验脚本约定：10＝不符合模板；0＝通过；其他＝脚本自身出错
+
+
+def lint_comment(args, before):
+    """写入前按上层技能的模板校验备注；不通过就拦下（退出码 7）。"""
+    path = find_comment_lint()
+    if not path:
+        return
+    if getattr(args, "skip_lint", False):
+        print(f"警告: 已按 --skip-lint 跳过备注模板校验（{path}）", file=sys.stderr)
+        return
+    if not path.is_file():
+        die(f"备注模板校验脚本不存在: {path}（检查 ZENTAO17_COMMENT_LINT）")
+    me = whoami(args.insecure)
+    me_account = str(me.get("account") or "")
+    account = reader_account(args, before)
+    audience = "tester" if args.cmd in ("resolve", "close") else role_of(account, me_account)
+    cmd = [sys.executable, str(path), "--cmd", args.cmd, "--audience", audience, "--bug", str(args.id),
+           "--account", account, "--me-account", me_account, "--me", str(me.get("realname") or "")]
+    if getattr(args, "resolution", None):
+        cmd += ["--resolution", args.resolution]
+    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    try:
+        r = subprocess.run(cmd, input=(args.comment or "").encode("utf-8"), capture_output=True, env=env, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        die(f"备注模板校验脚本运行失败（{path}）：{e}；未写入禅道")
+    out = (r.stdout + r.stderr).decode("utf-8", "replace").strip()
+    if r.returncode == LINT_VIOLATION:
+        die(f"备注未通过模板校验，已拦截、未写入禅道：\n{out}", EXIT_LINT)
+    if r.returncode != 0:
+        die(f"备注模板校验脚本出错（{path}，退出码 {r.returncode}），未写入禅道：\n{out[-800:]}")
+
+
+def _core(text):
+    """全文比对用：去标签、反转义、去掉所有空白。"""
+    return re.sub(r"\s+|<[^>]*>", "", strip_html(text or ""))
+
+
+def stored_mismatch(sent, fresh):
+    """写入生效后核对禅道实际保存的备注；返回 None 表示一致，否则返回说明。"""
+    want = _core(sent)
+    stored = [a.get("comment") for a in fresh if a.get("comment")]
+    if not want or any(_core(s) == want for s in stored):
+        return None
+    import difflib
+    best = max(stored, key=lambda s: difflib.SequenceMatcher(None, want, _core(s)).ratio(), default="")
+    ratio = difflib.SequenceMatcher(None, want, _core(best)).ratio()
+    probs = text_problems(strip_html(best))
+    if probs or ratio < 0.95:
+        return f"相似度 {ratio:.0%}" + (f"，{'；'.join(probs)}" if probs else "") + f"；禅道保存为: {strip_html(best)[:80]!r}"
+    return None
 
 
 def account_of(user):
@@ -719,6 +901,7 @@ def run_write(args, label, do_write, check, skip=None):
         if msg:
             print(f"Bug #{args.id} {msg}，未重复执行")
             return
+    lint_comment(args, before)
     before_max = last_action_id(before)
     failure = None
     try:
@@ -740,6 +923,11 @@ def run_write(args, label, do_write, check, skip=None):
         if failure:
             msg += f"（写请求曾报错：{failure[1]}；回读确认已生效，勿重试）"
         print(msg)
+        bad = stored_mismatch(args.comment, fresh) if getattr(args, "comment", None) else None
+        if bad:
+            die(f"Bug #{args.id} {label}已生效，但禅道保存的备注与发送内容不一致（{bad}）。\n"
+                "不要重复写同样内容：先执行 zentao17 doctor 排查环境，修好后追加一条「【乱码修正】」备注说明以新备注为准。",
+                EXIT_MISMATCH)
         return
     if failure and failure[0] == "api":
         die(failure[1])
@@ -1006,10 +1194,95 @@ def cmd_comment(args):
         # 只认本次新增的 action，旧的同文备注不算；禅道会转义/包裹 HTML，比对前先归一化。
         hit = [a for a in fresh if head in norm_text(a.get("comment"))]
         if not hit:
+            # 文本在传输中被改写时开头也对不上；仍有新增 commented 就算已写入，交给全文比对报不一致，
+            # 避免误判「未生效」后重试、重复写入乱码。
+            me = whoami(args.insecure).get("realname")
+            hit = [a for a in fresh if a.get("action") == "commented" and a.get("actor") == me]
+        if not hit:
             return False, "actions 未检到新备注"
         return True, f"已添加备注（by {hit[-1].get('actor')}）: {args.comment[:50]}..."
 
     run_write(args, "备注", write, check)
+
+
+# ---------- 环境自检：备注文本从调用方到本工具的通道是否保真 ----------
+def windows_codepages():
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        return {"ANSI(ACP)": k.GetACP(), "控制台输入": k.GetConsoleCP(), "控制台输出": k.GetConsoleOutputCP()}
+    except Exception:
+        return {}
+
+
+def cmd_doctor(args):
+    import locale
+    import platform
+    win = sys.platform.startswith("win")
+    print(f"zentao17 {VERSION} 环境自检")
+    rows = [("系统", f"{platform.system()} {platform.release()}"),
+            ("Python", f"{sys.version.split()[0]}（UTF-8 模式: {'开' if sys.flags.utf8_mode else '关'}）"),
+            ("首选编码", locale.getpreferredencoding(False)),
+            ("stdin / stdout", f"{sys.stdin.encoding} / {sys.stdout.encoding}"),
+            ("PYTHONUTF8", os.environ.get("PYTHONUTF8", "未设置"))]
+    if win:
+        rows += [(k, str(v)) for k, v in windows_codepages().items()]
+    else:
+        rows.append(("LANG / LC_ALL", f"{os.environ.get('LANG', '未设置')} / {os.environ.get('LC_ALL', '未设置')}"))
+    lint = find_comment_lint()
+    rows.append(("备注模板校验", str(lint) if lint else "未找到（当前目录及上级没有上层技能的校验脚本，不校验）"))
+    for k, v in rows:
+        print(f"  {k}: {v}")
+
+    # 环境项只作提示：写入路径不依赖它们（-F 按字节读、校验子进程固定 UTF-8），通道是否保真以探针为准
+    warnings, issues = [], []
+    if win and not sys.flags.utf8_mode and windows_codepages().get("ANSI(ACP)") != 65001:
+        warnings.append("Windows 未启用 UTF-8（Python 非 UTF-8 模式，ANSI 代码页非 65001）：shell 管道与 ANSI 写文件会损坏中日文")
+    if not win and "utf" not in locale.getpreferredencoding(False).lower():
+        warnings.append("locale 不是 UTF-8")
+
+    probes = []
+    if args.probe is not None:
+        got = decode_text(sys.stdin.buffer.read(), "标准输入") if args.probe == "-" else args.probe
+        probes.append(("标准输入管道" if args.probe == "-" else "命令行参数", got.strip()))
+    if args.probe_file:
+        try:
+            raw = Path(args.probe_file).expanduser().read_bytes()
+        except OSError as e:
+            die(f"读取探针文件失败: {e}")
+        probes.append(("文件", decode_text(raw, "探针文件").strip()))
+    for channel, got in probes:
+        if got == PROBE_SAMPLE:
+            print(f"  通道[{channel}]: ✓ 样本原样到达")
+        else:
+            why = "；".join(text_problems(got)) or "内容与样本不同"
+            issues.append(f"通道[{channel}] 损坏：{why}，收到 {got[:40]!r}")
+    if not probes:
+        print(f"\n用法：把样本原样作为备注的传入方式传进来检测通道，例如\n"
+              f"  zentao17 doctor --probe \"{PROBE_SAMPLE}\"\n"
+              f"  zentao17 doctor --probe-file <用文件工具写入样本的 UTF-8 文件>")
+
+    for w in warnings:
+        print(f"  ⚠ {w}")
+    if not issues:
+        print("\n结论: 已检测的通道未发现编码问题" if probes else
+              "\n结论: 未做通道探针，无法判断通道是否保真（环境提示见上）")
+        if warnings:
+            print("  · 环境提示不影响已通过探针的通道；不确定时一律用 -F 传 UTF-8 文件")
+        return
+    print("\n结论: 通道会损坏中日文，修好前不要用受损通道写禅道")
+    for i in issues:
+        print(f"  ✗ {i}")
+    print("\n处理：")
+    print("  · 无论环境如何，备注一律用文件工具写成 UTF-8 文件，再用 -F <文件> 传入（不经过 shell 编码，最稳妥）")
+    if win:
+        print("  · 本会话（PowerShell）：$env:PYTHONUTF8='1'; "
+              "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [Text.UTF8Encoding]::new($false)")
+        print("  · 本会话（cmd）：set PYTHONUTF8=1 && chcp 65001")
+        print("  · 长期：setx PYTHONUTF8 1，并把上面的 PowerShell 那行写进 $PROFILE；或改用 PowerShell 7（pwsh）")
+    else:
+        print("  · 设置 LANG/LC_ALL 为 UTF-8（如 export LANG=en_US.UTF-8 或 zh_CN.UTF-8）")
+    sys.exit(EXIT_SUSPICIOUS)
 
 
 # ---------- 自更新：从本机 skills 源仓库（git 克隆）拉取最新版，同步到部署副本 ----------
@@ -1257,15 +1530,36 @@ def main():
 
     p = sub.add_parser("comment", help="给 Bug 添加备注（网页会话通道，凭证复用 login）")
     p.add_argument("id", type=int)
-    p.add_argument("-c", "--comment", required=True, help="备注内容")
+    p.add_argument("-c", "--comment", help="备注内容（与 -F 二选一）")
     p.set_defaults(func=cmd_comment)
+
+    for name in WRITE_COMMANDS:
+        p = sub.choices[name]
+        p.add_argument("-F", "--comment-file", dest="comment_file",
+                       help="从 UTF-8 文件读备注（中日文备注推荐；-c - 则读标准输入）")
+        p.add_argument("--allow-suspicious", action="store_true",
+                       help="备注被判为疑似乱码时仍然写入（确认内容本来如此时用）")
+        p.add_argument("--skip-lint", action="store_true",
+                       help="跳过上层技能的备注模板校验（仅在用户明确要求时使用）")
+
+    p = sub.add_parser("doctor", help="环境自检：检查中日文备注从调用方到本工具是否保真（开工自检用）")
+    p.add_argument("--probe", help=f"把样本「{PROBE_SAMPLE}」原样传入检测命令行通道；- 表示从标准输入读")
+    p.add_argument("--probe-file", dest="probe_file", help="检测文件通道：内容为同一样本的 UTF-8 文件")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("self-update", help="从 skills 源仓库同步已推送到远端的版本到部署副本（6 小时节流）")
     p.add_argument("--force", action="store_true", help="忽略节流，立即检查")
     p.add_argument("--repo", help="skills 源仓库路径（首次找不到时指定，之后自动记住）")
     p.set_defaults(func=cmd_self_update)
 
+    for stream in (sys.stdout, sys.stderr):  # 输出端编码不支持中日文时转义输出，不因 UnicodeEncodeError 崩溃；
+        try:                                 # 必须在 parse_args 之前，--help 的输出也走这里
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
     args = parser.parse_args()
+    if args.cmd in WRITE_COMMANDS:
+        resolve_comment(args, required=args.cmd == "comment")
     if hasattr(signal, "SIGPIPE"):  # Windows Python 无 SIGPIPE，原样调用会 AttributeError 崩溃
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # 输出接 head 等管道被提前关闭时安静退出
     if args.cmd != "login" and not hasattr(args, "insecure"):
