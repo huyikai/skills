@@ -18,7 +18,7 @@
   zentao17 comment 123 -F note.md                     # 备注从 UTF-8 文件读（中日文推荐，所有写命令都支持）
   zentao17 doctor --probe "禅道検証・中文テスト①（全角）✅"  # 环境自检：中日文传入通道是否保真
   zentao17 users --search 孙杰                        # 查账号
-  zentao17 self-update                                # 从本机 skills 源仓库拉取最新版（6 小时节流）
+  zentao17 self-update                                # 报告版本与 lsp-web 是否落后远端（随 lsp-web 分发）
 
 写命令（resolve/close/activate/assign/comment）一律写后回读 actions 自验证，退出码:
   0 已生效（或目标状态已满足、未重复执行）  1 一般错误/服务端拒绝
@@ -32,17 +32,14 @@ import argparse
 import getpass
 import html
 import http.client
-import io
 import json
 import os
 import re
-import shutil
 import signal
 import socket
 import ssl
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import urllib.error
@@ -62,7 +59,7 @@ RESOLUTION_NAMES = {
 }
 
 # 与 SKILL.md 开头的「CLI 版本」一致；改了命令集就同时改两处
-VERSION = "2026-11-05.1"
+VERSION = "2026-11-05.2"
 
 EXIT_NOT_APPLIED = 3
 EXIT_UNKNOWN = 4
@@ -1285,139 +1282,38 @@ def cmd_doctor(args):
     sys.exit(EXIT_SUSPICIOUS)
 
 
-# ---------- 自更新：从本机 skills 源仓库（git 克隆）拉取最新版，同步到部署副本 ----------
+# ---------- 更新：zentao17 随 lsp-web 仓库分发（frontend/.agents/skills/zentao17），不再自同步 ----------
 SKILL_DIR = Path(__file__).resolve().parent.parent
-SOURCE_MARK = SKILL_DIR / ".source-repo"   # 源仓库位置，首次找到后记住
-CHECK_STAMP = SKILL_DIR / ".update-check"  # 上次成功检查的时间，用于节流
-UPDATE_INTERVAL = 6 * 3600
-KEEP_FILES = {"LOCAL.md", ".source-repo", ".update-check"}  # 本机私有，同步时不删不改
-IGNORED = {"__pycache__", ".DS_Store"}
-SCAN_PRUNE = {"node_modules", "Library", "AppData", "Applications", "Pictures", "Music", "Movies", "venv"}
-
-
-def git(repo, *args):
-    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
-                       encoding="utf-8", errors="replace")
-    return r.returncode, r.stdout.strip(), r.stderr.strip()
-
-
-def is_source_repo(path):
-    path = Path(path)
-    return (path / "skills" / "zentao17" / "scripts" / "zentao17.py").is_file() and (path / ".git").exists()
-
-
-def find_source_repo(explicit=None):
-    if explicit:
-        path = Path(explicit).expanduser()
-        return path.resolve() if is_source_repo(path) else None
-    candidates = []
-    if os.environ.get("ZENTAO17_SKILLS_REPO"):
-        candidates.append(Path(os.environ["ZENTAO17_SKILLS_REPO"]).expanduser())
-    if SOURCE_MARK.is_file():
-        candidates.append(Path(SOURCE_MARK.read_text(encoding="utf-8").strip()))
-    candidates.append(SKILL_DIR.parent.parent)  # 部署副本本身就是源仓库里的 skills/zentao17
-    for path in candidates:
-        if is_source_repo(path):
-            return path.resolve()
-    # 兜底：在用户主目录下浅层扫描（跳过隐藏目录与大目录，限时 5 秒）
-    home, deadline = Path.home(), time.time() + 5
-    for root, dirs, _ in os.walk(home):
-        if time.time() > deadline:
-            break
-        if is_source_repo(root):
-            return Path(root).resolve()
-        depth = len(Path(root).relative_to(home).parts)
-        dirs[:] = [] if depth >= 4 else [d for d in dirs if not d.startswith(".") and d not in SCAN_PRUNE]
-    return None
-
-
-def mirror(src, dst, top=False):
-    """让 dst 与 src 内容一致（KEEP_FILES 只在顶层保护，LOCAL.md 仅在 dst 缺失时带入）；返回是否有改动。"""
-    changed = False
-    dst.mkdir(exist_ok=True)
-    src_names = {n for n in os.listdir(src) if n not in IGNORED}
-    for name in os.listdir(dst):
-        if name in src_names or name in IGNORED or (top and name in KEEP_FILES):
-            continue
-        target = dst / name
-        if target.is_dir() and not target.is_symlink():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
-        changed = True
-    for name in sorted(src_names):
-        s, d = src / name, dst / name
-        if top and name in KEEP_FILES and d.exists():
-            continue
-        if s.is_dir():
-            changed = mirror(s, d) or changed
-        elif not d.is_file() or s.read_bytes() != d.read_bytes():
-            shutil.copy2(s, d)
-            changed = True
-    return changed
-
-
-def deployed_version():
-    m = re.search(r'^VERSION = "([^"]+)"', (SKILL_DIR / "scripts" / "zentao17.py").read_text(encoding="utf-8"), re.M)
-    return m.group(1) if m else "?"
-
-
-def upstream_tree(repo, dest):
-    """把源仓库已推送版本（上游跟踪分支）的 skills/zentao17 导出到 dest；返回导出目录，失败返回 None。"""
-    rc, ref, _ = git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
-    ref = ref if rc == 0 and ref else "origin/main"
-    r = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", ref, "skills/zentao17"], capture_output=True)
-    if r.returncode != 0:
-        return None, ref
-    with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tar:
-        if hasattr(tarfile, "data_filter"):
-            tar.extractall(dest, filter="data")
-        else:
-            tar.extractall(dest)
-    return Path(dest) / "skills" / "zentao17", ref
 
 
 def cmd_self_update(args):
-    if not args.force and CHECK_STAMP.is_file() and time.time() - CHECK_STAMP.stat().st_mtime < UPDATE_INTERVAL:
-        print(f"zentao17 {VERSION}：{UPDATE_INTERVAL // 3600} 小时内已检查过，跳过（--force 立即检查）")
+    """保留给开工自检调用：只报告版本与本技能目录是否落后远端；会 fetch，但不合并、不改工作区。"""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+
+    def git(*a):
+        try:
+            r = subprocess.run(["git", "-C", str(SKILL_DIR), *a], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=30,
+                               stdin=subprocess.DEVNULL, env=env)
+            return r.returncode, r.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return 1, ""
+
+    rc, top = git("rev-parse", "--show-toplevel")
+    if rc != 0:
+        print(f"zentao17 {VERSION}：当前副本不在 git 仓库里（{SKILL_DIR}），是迁移前的旧部署副本。"
+              "zentao17 已随 lsp-web 分发，按 lsp-web/frontend/README.md「新机器初始化」第 4 节重建链接")
         return
-    try:
-        repo = find_source_repo(args.repo)
-        if repo is None:
-            die("找不到 skills 源仓库（含 skills/zentao17 的 git 克隆）。"
-                "用 zentao17 self-update --repo <克隆路径> 指定一次，之后自动记住", 2)
-        SOURCE_MARK.write_text(f"{repo}\n", encoding="utf-8")
-        head_before = git(repo, "rev-parse", "HEAD")[1]
-        rc, out, err = git(repo, "fetch", "-q", "origin")
-        if rc != 0:
-            print(f"注意: git fetch 失败，按本机已知的远端版本同步：{err or out}")
-        git(repo, "pull", "--ff-only", "-q")  # 顺带让源仓库跟上远端；失败不影响部署
-        src = repo / "skills" / "zentao17"
-        if src.resolve() == SKILL_DIR:
-            changed = git(repo, "rev-parse", "HEAD")[1] != head_before
-        else:
-            # 只部署已推送到远端的内容：本机提交但未推送、或未提交的改动都不生效
-            with tempfile.TemporaryDirectory() as tmp:
-                tree, ref = upstream_tree(repo, tmp)
-                if tree is None or not (tree / "SKILL.md").is_file():
-                    die(f"无法从源仓库的 {ref} 导出 skills/zentao17", 2)
-                if not (SKILL_DIR / "LOCAL.md").exists() and (src / "LOCAL.md").is_file():
-                    shutil.copy2(src / "LOCAL.md", tree / "LOCAL.md")
-                changed = mirror(tree, SKILL_DIR, top=True)
-            unpushed = git(repo, "log", "--oneline", f"{ref}..HEAD", "--", "skills/zentao17")[1]
-            if unpushed or git(repo, "status", "--porcelain", "--", "skills/zentao17")[1]:
-                print(f"注意: 源仓库有未推送或未提交的 zentao17 改动，未部署（只部署已推送到 {ref} 的内容）")
-    except FileNotFoundError:
-        die("找不到 git 命令，无法自更新", 2)
-    if rc == 0:
-        CHECK_STAMP.write_text(time.strftime("%Y-%m-%d %H:%M:%S\n"), encoding="utf-8")
-    new_version = deployed_version()
-    if new_version != VERSION:
-        print(f"zentao17 已更新：{VERSION} → {new_version}。请重新读取 SKILL.md 与 LOCAL.md 后再继续")
-    elif changed:
-        print(f"zentao17 内容已更新（版本 {VERSION}）。请重新读取 SKILL.md 与 LOCAL.md 后再继续")
+    fetched = git("fetch", "-q")[0] == 0
+    rc, behind = git("rev-list", "--count", "HEAD..@{u}", "--", ".")
+    note = "" if fetched else "（fetch 失败，按本机已知的远端比对）"
+    if rc == 0 and behind.isdigit() and int(behind) > 0:
+        print(f"zentao17 {VERSION}：本技能落后远端 {behind} 个提交{note}；请用户在 {top} 执行 git pull，"
+              "之后重新读取 SKILL.md 与 LOCAL.md")
+    elif rc == 0:
+        print(f"zentao17 {VERSION}：随 {top} 分发，本技能与远端一致{note}")
     else:
-        print(f"zentao17 {VERSION}：已是最新")
+        print(f"zentao17 {VERSION}：随 {top} 分发，无法与远端比对{note}，按当前版本继续")
 
 
 def main():
@@ -1547,9 +1443,9 @@ def main():
     p.add_argument("--probe-file", dest="probe_file", help="检测文件通道：内容为同一样本的 UTF-8 文件")
     p.set_defaults(func=cmd_doctor)
 
-    p = sub.add_parser("self-update", help="从 skills 源仓库同步已推送到远端的版本到部署副本（6 小时节流）")
-    p.add_argument("--force", action="store_true", help="忽略节流，立即检查")
-    p.add_argument("--repo", help="skills 源仓库路径（首次找不到时指定，之后自动记住）")
+    p = sub.add_parser("self-update", help="报告版本与所在仓库（lsp-web）是否落后远端；zentao17 随 lsp-web 分发，不再自同步")
+    p.add_argument("--force", action="store_true", help="（兼容旧用法，已无作用）")
+    p.add_argument("--repo", help="（兼容旧用法，已无作用）")
     p.set_defaults(func=cmd_self_update)
 
     for stream in (sys.stdout, sys.stderr):  # 输出端编码不支持中日文时转义输出，不因 UnicodeEncodeError 崩溃；

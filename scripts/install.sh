@@ -38,6 +38,7 @@ repo_skills() {
   for d in "$SKILLS_DIR"/*/; do
     [ -f "$d/SKILL.md" ] || continue
     [ "$(basename "$d")" = "_template" ] && continue
+    [ -f "$d/MIGRATED" ] && continue  # 已迁到别处分发的 skill，不再安装或刷新
     basename "$d"
   done
 }
@@ -108,6 +109,7 @@ refresh_one() {
 install_one() {
   local name="$1" target="$2"
   [ -f "$SKILLS_DIR/$name/SKILL.md" ] || die "仓库中不存在 skill: $name"
+  [ -f "$SKILLS_DIR/$name/MIGRATED" ] && die "$name 已迁出本仓库：$(cat "$SKILLS_DIR/$name/MIGRATED")"
   mkdir -p "$target"
   if refresh_one "$name" "$target"; then
     echo "已安装: $name -> $target/$name"

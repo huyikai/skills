@@ -5,38 +5,40 @@ description: 通过 zentao17 命令行工具查询和操作公司自部署禅道
 
 # 禅道 17.8 CLI（zentao17）
 
+> **已迁移，这里是最后一版快照**：自 2026-11-05 起，zentao17 随 LSP 项目的 lsp-web 仓库分发（`frontend/.agents/skills/zentao17/`），后续改动只提交到那里，本目录不再更新。用户目录里的旧部署副本请按 lsp-web `frontend/README.md`「新机器初始化」第 4 节迁移；不要删掉本目录，旧版 `self-update` 还要从这里取到这份快照。
+
 公司禅道自部署于固定 IP，版本 **17.8**。官方 `zentao-cli` 需要 API 2.0（禅道 22+），在本环境不可用（会误报「用户名和密码不正确」）。本技能使用 `zentao17` 命令，基于 v1 RESTful API（禅道 12.0+ 均支持）；v1 不开放的激活、转派、独立备注走网页会话通道。
 
 本技能只管「怎么读写禅道」。具体项目的处理流程（何时 resolve、推送顺序、流转给谁）由上层技能规定，例如 LSP 项目的 zentao-bug-handling／zentao-unattended；**上层技能已授权的写操作，按上层规定执行，不再逐条向用户复述确认**。
 
-**CLI 版本：2026-11-05.1**（`zentao17 --version` 应输出同一值）。
+**CLI 版本：2026-11-05.2**（`zentao17 --version` 应输出同一值）。
 
 ## 开工自检（每次调用都执行）
 
-1. **先自更新**：执行 `zentao17 self-update`。它把 skills 源仓库**已推送到远端**的版本同步到本技能目录（本机未推送、未提交的改动不会生效），6 小时内只真正检查一次，其余调用直接返回「跳过」。
-2. **再核对版本**：`self-update` 输出「已更新」，或 `zentao17 --version` 与上面的 CLI 版本不同，或对话里记得的命令表与 `zentao17 --help` 不一致时，重新读本文件与同目录的 `LOCAL.md`，以新读到的为准。长会话里早先读过的内容可能已经过期。
-3. **自更新失败不阻塞**：报「找不到 skills 源仓库」时，在用户主目录下找含 `skills/zentao17/scripts/zentao17.py` 的 git 克隆，执行 `zentao17 self-update --repo <克隆路径>` 记住一次；找不到或 git 失败时按当前版本继续，在回复里提一句。不要为此改源仓库或执行 `git reset` 之类的命令。
+1. **先看版本与同步状态**：执行 `zentao17 self-update`。本技能随 lsp-web 仓库分发（`lsp-web/frontend/.agents/skills/zentao17/`），这条命令只报告版本、以及本技能目录是否落后远端：它会 fetch，但不合并、不改工作区。输出带「fetch 失败」时，在回复里提一句网络或凭据问题。报「落后远端」时提醒用户在 lsp-web 主 checkout 执行 `git pull`，不要自己去拉；报「不在 git 仓库里」说明 `zentao17` 还指向迁移前的旧部署副本，按 lsp-web `frontend/README.md`「新机器初始化」重建链接。
+2. **再核对版本**：`zentao17 --version` 与上面的 CLI 版本不同，或对话里记得的命令表与 `zentao17 --help` 不一致时，重新读本文件与同目录的 `LOCAL.md`，以新读到的为准。长会话里早先读过的内容可能已经过期。版本**低于**本文件记载时，多半是 `zentao17` 还指向迁移前的旧副本：查看 `~/.local/bin/zentao17`（Windows 为 PATH 里的 `zentao17.cmd`）指向哪里，不在 lsp-web 的 `frontend/.agents/skills/zentao17/` 下就提醒用户按 lsp-web `frontend/README.md`「新机器初始化」第 4 节迁移。
+3. **检查失败不阻塞**：git 不可用或网络不通时按当前版本继续，在回复里提一句。不要为此执行 `git reset`、`git pull` 之类改动仓库的命令。
 4. **能力以 `--help` 为准**：说「CLI 不支持某操作」之前，先执行 `zentao17 --help`（必要时 `zentao17 <子命令> --help`）。只有确认命令不存在，或实际执行后失败（退出码 1/3/4），才可以说做不到，并附上命令输出。记忆、旧文档和 spec 里的历史记录都不能作为「做不到」的依据。
 5. **做不到时不用别的写操作凑结果**：例如不能转派时，不得用 resolve（含 `-r external`）代替；保持原状态，带上命令输出向用户说明。
 6. **编码自检（本会话第一次写禅道之前）**：用文件工具（不是 shell 的 echo／heredoc／`Set-Content`）把样本 `禅道検証・中文テスト①（全角）✅` 写进一个 UTF-8 临时文件，执行 `zentao17 doctor --probe-file <该文件>`；打算用 `-c` 传备注的，再执行一次 `zentao17 doctor --probe "禅道検証・中文テスト①（全角）✅"`。退出码 5 说明该通道会损坏中日文：按输出的处理步骤修好后重跑，修好之前只用通过检测的通道写禅道。输出里的「⚠」环境提示（如 Windows 未启用 UTF-8）不影响已通过探针的通道，不要为此去改系统或持久配置；用 `-F` 传文件即可。Windows 上尤其不能省（2026-10-31 #48775 就是 Windows 环境把中日文换成了「?」后写入）。
 
 ## 本地配置与路径
 
-- `LOCAL.md` 与本文件在同一目录（本机为 `~/.agents/skills/zentao17/LOCAL.md`，各工具的 skills 目录下是指向它的链接）。里面有禅道地址、Bug 拉取口径、课题映射和**常用角色账号**（本人／产品／后端）。转派前先在这里查对方账号，查不到再用 `zentao17 users --search <姓名>`，不要把整张用户表交给用户去挑。
-- shell 报 `command not found: zentao17` 时，说明 `~/.local/bin` 不在该工具的 PATH 里，不代表没装。改用 `~/.local/bin/zentao17 …` 或 `python3 ~/.agents/skills/zentao17/scripts/zentao17.py …`。
+- `LOCAL.md` 与本文件在同一目录（lsp-web 主 checkout 的 `frontend/.agents/skills/zentao17/LOCAL.md`，已 gitignore；worktree 里的 `frontend/.agents` 是指向它的链接）。里面有禅道地址、Bug 拉取口径、课题映射和**常用角色账号**（本人／产品／后端）。转派前先在这里查对方账号，查不到再用 `zentao17 users --search <姓名>`，不要把整张用户表交给用户去挑。
+- shell 报 `command not found: zentao17` 时，说明 `~/.local/bin` 不在该工具的 PATH 里，不代表没装。改用 `~/.local/bin/zentao17 …`，或在 worktree 的 `frontend` 下执行 `python3 .agents/skills/zentao17/scripts/zentao17.py …`。
 
 ## 首次使用：安装 CLI 命令
 
-`zentao17` 命令即本技能目录下的 `scripts/zentao17.py`（自带 shebang，仅依赖 Python 标准库）。软链到 PATH 中任意目录即可：
+`zentao17` 命令即本技能目录下的 `scripts/zentao17.py`（自带 shebang，仅依赖 Python 标准库）。把它软链到 PATH 中任意目录即可（`<lsp-web>` 为本机 lsp-web 克隆路径）：
 
 ```bash
-ln -sf /path/to/skills/zentao17/scripts/zentao17.py ~/.local/bin/zentao17
+ln -sf <lsp-web>/frontend/.agents/skills/zentao17/scripts/zentao17.py ~/.local/bin/zentao17
 zentao17 --help
 ```
 
 之后创建本地私有配置：`cp LOCAL.example.md LOCAL.md`，填写禅道地址、Bug 拉取口径与课题号映射（该文件已 gitignore，不入库）。最后按「凭证安全」一节在终端执行 `zentao17 login`。
 
-自更新的细节：源仓库位置首次找到后记在本目录的 `.source-repo`；同步时保留 `LOCAL.md`；只部署源仓库上游分支（通常是 `origin/main`）里的内容，本机提交但未推送的改动不会部署，避免未经审核的规则生效。
+更新方式：本技能的改动与 lsp-web 的其他技能一样提交到 lsp-web，其他机器 `git pull` lsp-web 即生效。2026-11-05 之前本技能在个人 skills 仓库分发、经 `self-update` 同步到 `~/.agents/skills/zentao17/`，那份部署副本已停止更新。
 
 ## 凭证安全
 
@@ -66,7 +68,7 @@ zentao17 --help
 | 添加备注 | `zentao17 comment <id> -c "备注"`（网页会话通道，不改状态） |
 | 备注从文件读 | 所有写命令都可用 `-F <UTF-8 文件>` 代替 `-c`（`-c -` 读标准输入）；见「中日文备注的传入方式」 |
 | 环境自检 | `zentao17 doctor [--probe "<样本>"] [--probe-file <文件>]`（见「开工自检」第 6 条） |
-| 自更新 | `zentao17 self-update [--force] [--repo <源仓库路径>]` |
+| 版本与同步状态 | `zentao17 self-update`（只报告，不拉取） |
 
 常用选项：`--limit 50 --page 1` 分页；`--all` 取全部页；`--order id_desc` 排序；`--json` 输出原始 JSON 供程序处理；`--insecure` 忽略自签名证书（全局参数，放在子命令前）。
 
@@ -168,4 +170,4 @@ v1 API 在禅道 17.8 上不开放激活、独立备注与转派（activate 路�
 | HTTP 404 | 服务端无此接口，确认禅道版本 |
 | 无法连接（已自动重试 3 次） | 地址或网络问题，HTTPS 自签名证书加 `--insecure` |
 | 写命令退出码 3～7 | 见「写命令的回读与退出码」 |
-| `self-update` 报找不到源仓库 | 见「开工自检」第 3 条 |
+| `self-update` 报不在 git 仓库里 | `zentao17` 指向迁移前的旧副本，按 lsp-web README 重建链接 |
