@@ -9,7 +9,7 @@
 
 配置查找顺序: --config 指定路径 > ./quota-watch.json > <技能目录>/config.json > ~/.config/quota-watch/config.json
 支持平台: zhipu(智谱GLM Coding Plan) / minimax(Token Plan) / deepseek(按量余额)
-          / relay_quota(兼容 /v1/usage 配额窗口的中转站)
+          / relay_quota(兼容 /v1/usage 配额窗口的中转站) / mimo(小米 MiMo Token Plan)
 """
 
 import argparse
@@ -229,8 +229,78 @@ def check_relay_quota(p):
     return make_simple(p.get("name", "Relay"), seg, rows, emoji="🛰")
 
 
+def check_mimo(p):
+    key = resolve(p.get("api_key", ""))
+    if not key:
+        return make_error(p.get("name", "MiMo"), "未配置 api_key（需 Token Plan 专属 tp- 开头的 key）")
+    data = http_get_json("https://token-plan-cn.xiaomimimo.com/v1/platform/token_plan",
+                         [f"Authorization: Bearer {key}"])
+    quota, period = data.get("quota") or {}, data.get("period") or {}
+    total, used = quota.get("total_credits"), quota.get("used_credits")
+    if data.get("object") != "token_plan" or not total or used is None:
+        return make_error(p.get("name", "MiMo"), f"接口返回异常: {json.dumps(data, ensure_ascii=False)[:150]}")
+
+    def utc_ms(s):  # 接口返回 UTC "YYYY-MM-DD HH:mm:ss"
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp() * 1000
+
+    pct = used / total * 100
+    remaining = quota.get("remaining_credits", max(0, total - used))
+    rows = [("本期已用", f"{pct:.1f}%　{used / 1e8:,.1f} 亿 / {total / 1e8:,.1f} 亿积分"),
+            ("剩余", f"{remaining / 1e8:,.1f} 亿积分")]
+    renew = "开" if data.get("auto_renew") else "关"
+    if period.get("start_at") and period.get("end_at"):
+        start, end = utc_ms(period["start_at"]), utc_ms(period["end_at"])
+        ideal = (time.time() * 1000 - start) / (end - start) * 100
+        rows += [("理想应达", f"{ideal:.1f}%"),
+                 ("计费周期", f"{fmt_ms(start)} → {fmt_ms(end)}（自动续费{renew}）")]
+        return make_result(p.get("name", "MiMo"), f"{data.get('plan_code', '?')} 套餐",
+                           pct, ideal, start, end, rows)
+    rows.append(("计费周期", f"未知（自动续费{renew}）"))
+    return make_simple(p.get("name", "MiMo"), f"{p.get('name', 'MiMo')} {pct:.0f}%", rows)
+
+
+def check_cursor(p):
+    token = resolve(p.get("api_key", ""))
+    if not token:
+        return make_error(p.get("name", "Cursor"),
+                          "未配置 api_key（浏览器 cursor.com 的 WorkosCursorSessionToken cookie）")
+    data = http_get_json("https://cursor.com/api/usage-summary",
+                         [f"Cookie: WorkosCursorSessionToken={token}",
+                          "Accept: application/json"], timeout=30)
+    if data.get("error"):
+        return make_error(p.get("name", "Cursor"),
+                          f"接口返回: {data.get('error')}（token 可能过期，重新登录 cursor.com 复制 cookie）")
+    if data.get("isUnlimited"):
+        return make_simple(p.get("name", "Cursor"), f"{p.get('name', 'Cursor')} ♾",
+                           [("套餐", data.get("membershipType", "?")), ("状态", "✅ 不限量")])
+    ind = data.get("individualUsage") or {}
+    plan = ind.get("plan") or {}
+    if not plan or not plan.get("enabled"):
+        return make_error(p.get("name", "Cursor"), "响应中无个人套餐用量数据")
+    start = datetime.fromisoformat(data["billingCycleStart"].replace("Z", "+00:00")).timestamp() * 1000
+    end = datetime.fromisoformat(data["billingCycleEnd"].replace("Z", "+00:00")).timestamp() * 1000
+    ideal = (time.time() * 1000 - start) / (end - start) * 100
+    used = plan.get("totalPercentUsed") or 0.0
+    api_pct, auto_pct = plan.get("apiPercentUsed"), plan.get("autoPercentUsed")
+    mix = f"（API {api_pct:.0f}% / 自动 {auto_pct:.0f}%）" if api_pct is not None and auto_pct is not None else ""
+    bk = plan.get("breakdown") or {}
+    total_cents = bk.get("total") or 0
+    rows = [("本期已用", f"{used:.1f}%　综合{mix}"),
+            ("理想应达", f"{ideal:.1f}%")]
+    if total_cents:
+        rows.append(("额度构成", f"含赠金 ${total_cents / 100:.2f}（赠送 ${(total_cents - bk.get('included', 0)) / 100:.2f}）"))
+    rows.append(("计费周期", f"{fmt_ms(start)} → {fmt_ms(end)}"))
+    result = make_result(p.get("name", "Cursor"),
+                         f"{data.get('membershipType', '?')} 套餐", used, ideal, start, end, rows)
+    od = ind.get("onDemand") or {}
+    if od.get("enabled") and od.get("used") is not None:
+        result["rows"].append(("按量消费", f"${od['used'] / 100:.2f}"))
+    return result
+
+
 CHECKERS = {"zhipu": check_zhipu, "minimax": check_minimax,
-            "deepseek": check_deepseek, "relay_quota": check_relay_quota}
+            "deepseek": check_deepseek, "relay_quota": check_relay_quota,
+            "mimo": check_mimo, "cursor": check_cursor}
 
 
 # ---------------------------------------------------------------- 渲染与推送
